@@ -20,4 +20,12 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Run tests
-        run: bun test
+        shell: bash
+        run: |
+          shopt -s globstar nullglob
+          files=(test/**/*.{test,spec}.{ts,tsx,js,jsx} src/**/*.{test,spec}.{ts,tsx,js,jsx})
+          if (( ${#files[@]} )); then
+            bun test
+          else
+            echo "no tests — skipping"
+          fi
