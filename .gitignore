@@ -1,0 +1,4 @@
+git-weld
+dist/
+*.bun-build
+node_modules/
