@@ -57,6 +57,8 @@ func (c *CLI) run(args []string) error {
 		return c.runPrepend(args[1:])
 	case "unstack":
 		return c.runUnstack(args[1:])
+	case "drop":
+		return c.runDrop(args[1:])
 	case "show":
 		return c.runShow(args[1:])
 	case "status":
@@ -177,6 +179,24 @@ func (c *CLI) runUnstack(args []string) error {
 	}
 	c.bindReporter(svc)
 	return svc.Unstack(args[0], base)
+}
+
+func (c *CLI) runDrop(args []string) error {
+	branch, remote, policy, reparent, err := parseDropArgs(args)
+	if err != nil {
+		return err
+	}
+	svc, err := weld.Open(c.cwd)
+	if err != nil {
+		return err
+	}
+	c.bindReporter(svc)
+	return svc.Drop(branch, weld.DropOptions{
+		Remote:   remote,
+		Promote:  policy == "promote",
+		Cascade:  policy == "cascade",
+		Reparent: reparent,
+	})
 }
 
 func (c *CLI) runBeside(args []string) error {
@@ -455,6 +475,60 @@ func parsePrependArgs(args []string) ([]string, map[string]bool, map[string]stri
 	return positional, flags, values, nil
 }
 
+func parseDropArgs(args []string) (string, bool, string, string, error) {
+	branch := ""
+	remote := false
+	policy := ""
+	reparent := ""
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch arg {
+		case "--remote":
+			remote = true
+		case "--promote":
+			if policy != "" {
+				return "", false, "", "", errors.New("usage: git weld drop <branch> [--promote | --cascade | --reparent <branch>] [--remote]")
+			}
+			policy = "promote"
+		case "--cascade":
+			if policy != "" {
+				return "", false, "", "", errors.New("usage: git weld drop <branch> [--promote | --cascade | --reparent <branch>] [--remote]")
+			}
+			policy = "cascade"
+		case "--reparent":
+			if policy != "" {
+				return "", false, "", "", errors.New("usage: git weld drop <branch> [--promote | --cascade | --reparent <branch>] [--remote]")
+			}
+			i++
+			if i >= len(args) {
+				return "", false, "", "", errors.New("usage: git weld drop <branch> [--promote | --cascade | --reparent <branch>] [--remote]")
+			}
+			policy = "reparent"
+			reparent = args[i]
+		default:
+			if strings.HasPrefix(arg, "--reparent=") {
+				if policy != "" {
+					return "", false, "", "", errors.New("usage: git weld drop <branch> [--promote | --cascade | --reparent <branch>] [--remote]")
+				}
+				policy = "reparent"
+				reparent = strings.TrimPrefix(arg, "--reparent=")
+				continue
+			}
+			if strings.HasPrefix(arg, "-") {
+				return "", false, "", "", fmt.Errorf("unknown flag %q", arg)
+			}
+			if branch != "" {
+				return "", false, "", "", errors.New("usage: git weld drop <branch> [--promote | --cascade | --reparent <branch>] [--remote]")
+			}
+			branch = arg
+		}
+	}
+	if branch == "" {
+		return "", false, "", "", errors.New("usage: git weld drop <branch> [--promote | --cascade | --reparent <branch>] [--remote]")
+	}
+	return branch, remote, policy, reparent, nil
+}
+
 func (c *CLI) runPR(args []string) error {
 	branch, title, body, draft, web, err := parsePRArgs(args)
 	if err != nil {
@@ -552,6 +626,7 @@ func printHelp(out io.Writer) {
 	fmt.Fprintln(out, "  beside <target> <source>")
 	fmt.Fprintln(out, "  prepend [-c|--create] <branch> [--beside <branch>]")
 	fmt.Fprintln(out, "  unstack <branch> [<base>]")
+	fmt.Fprintln(out, "  drop <branch> [--promote | --cascade | --reparent <branch>] [--remote]")
 	fmt.Fprintln(out, "  show [<branch>] [--tree]")
 	fmt.Fprintln(out, "  status [<branch>] [--tree]")
 	fmt.Fprintln(out, "  diff [<branch>]")

@@ -25,6 +25,7 @@ Current commands:
 - `git weld beside <target> <source>`
 - `git weld prepend [-c|--create] <branch> [--beside <branch>]`
 - `git weld unstack <branch> [<base>]`
+- `git weld drop <branch> [--promote | --cascade | --reparent <branch>] [--remote]`
 - `git weld show [<branch>] [--tree]`
 - `git weld status [<branch>] [--tree]`
 - `git weld diff [<branch>]`
@@ -89,6 +90,23 @@ Current commands:
 
 - removes `[<base>]` from the branch's explicit parents
 - if the last explicit parent is removed, the branch falls back to the implicit root branch
+
+### `git weld drop <branch> [--promote | --cascade | --reparent <branch>] [--remote]`
+
+- deletes a weld-managed branch
+- if the branch has no downstream branches, no policy flag is required
+- if the branch has downstream branches, one of these policies is required:
+  - `--promote`
+    - downstream branches inherit the dropped branch's direct parents
+  - `--cascade`
+    - deletes the full downstream weld tree
+  - `--reparent <branch>`
+    - downstream branches replace the dropped branch with the given direct parent
+- after graph changes, affected surviving descendants are rebased onto their new effective bases
+- `--remote` also:
+  - closes any GitHub PR for the dropped branch
+  - deletes the remote branch
+  - publishes affected surviving descendants and refreshes their PR bases/bodies if needed
 
 ### `git weld show [<branch>]`
 

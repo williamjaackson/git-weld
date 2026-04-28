@@ -190,6 +190,84 @@ func TestUnstackLastParentFallsBackToImplicitMaster(t *testing.T) {
 	}
 }
 
+func TestDropLeafDeletesLocalBranchAndMetadata(t *testing.T) {
+	repoDir := initRepo(t)
+	svc := openService(t, repoDir)
+	if err := svc.NewBranch("fix-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.Drop("fix-1", DropOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if svc.repo.BranchExists("fix-1") {
+		t.Fatal("expected fix-1 local branch to be deleted")
+	}
+	managed, err := svc.meta.ManagedBranches()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contains(managed, "fix-1") {
+		t.Fatalf("expected fix-1 metadata to be removed, got %v", managed)
+	}
+}
+
+func TestDropPromoteReparentsChildrenToDroppedParents(t *testing.T) {
+	repoDir := initRepo(t)
+	svc := openService(t, repoDir)
+	if err := svc.NewBranch("fix-1"); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, repoDir, "fix1.txt", "fix1\n")
+	runGit(t, repoDir, "add", "fix1.txt")
+	runGit(t, repoDir, "commit", "-m", "fix-1")
+
+	if err := svc.Stack("feature", "fix-1", true); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, repoDir, "feature.txt", "feature\n")
+	runGit(t, repoDir, "add", "feature.txt")
+	runGit(t, repoDir, "commit", "-m", "feature")
+
+	runGit(t, repoDir, "checkout", "master")
+	if err := svc.Drop("fix-1", DropOptions{Promote: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	if svc.repo.BranchExists("fix-1") {
+		t.Fatal("expected fix-1 local branch to be deleted")
+	}
+	parents, err := svc.meta.Parents("feature")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parents) != 0 {
+		t.Fatalf("expected feature to fall back to implicit master, got %#v", parents)
+	}
+	if rangeLog := runGit(t, repoDir, "log", "--oneline", "master..feature"); !strings.Contains(rangeLog, "feature") || strings.Contains(rangeLog, "fix-1") {
+		t.Fatalf("expected feature range over master to contain only feature commit, got:\n%s", rangeLog)
+	}
+}
+
+func TestDropCascadeDeletesDownstreamTree(t *testing.T) {
+	repoDir := initRepo(t)
+	svc := openService(t, repoDir)
+	if err := svc.NewBranch("fix-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Stack("feature", "fix-1", true); err != nil {
+		t.Fatal(err)
+	}
+
+	runGit(t, repoDir, "checkout", "master")
+	if err := svc.Drop("fix-1", DropOptions{Cascade: true}); err != nil {
+		t.Fatal(err)
+	}
+	if svc.repo.BranchExists("fix-1") || svc.repo.BranchExists("feature") {
+		t.Fatal("expected cascade drop to delete fix-1 and feature")
+	}
+}
+
 func TestPrependInsertsBranchAboveCurrentBranch(t *testing.T) {
 	repoDir := initRepo(t)
 	svc := openService(t, repoDir)
@@ -703,6 +781,42 @@ func TestShipDeletesStaleRemoteSyntheticBranch(t *testing.T) {
 	}
 	if out := runGit(t, repoDir, "ls-remote", "--heads", "origin", "_weld/feature"); out != "" {
 		t.Fatalf("expected remote synthetic branch to be deleted, got: %s", out)
+	}
+}
+
+func TestDropRemoteClosesPRAndDeletesRemoteBranch(t *testing.T) {
+	repoDir := initRepo(t)
+	remoteDir := t.TempDir()
+	runGit(t, remoteDir, "init", "--bare")
+	runGit(t, repoDir, "remote", "add", "origin", remoteDir)
+	runGit(t, repoDir, "push", "-u", "origin", "master")
+	fakeBin := filepath.Join(t.TempDir(), "gh")
+	ghLog := filepath.Join(t.TempDir(), "gh.log")
+	ghState := filepath.Join(t.TempDir(), "gh.state")
+	writeFakeGH(t, fakeBin, ghLog, ghState)
+	if err := os.WriteFile(ghState, []byte("existing"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", filepath.Dir(fakeBin)+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	svc := openService(t, repoDir)
+	if err := svc.NewBranch("fix-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Ship("fix-1", false, SyncModeDefault); err != nil {
+		t.Fatal(err)
+	}
+
+	runGit(t, repoDir, "checkout", "master")
+	if err := svc.Drop("fix-1", DropOptions{Remote: true}); err != nil {
+		t.Fatal(err)
+	}
+	logText := string(mustReadFile(t, ghLog))
+	if !strings.Contains(logText, "pr close 42") {
+		t.Fatalf("expected PR close call, got:\n%s", logText)
+	}
+	if out := runGit(t, repoDir, "ls-remote", "--heads", "origin", "fix-1"); out != "" {
+		t.Fatalf("expected remote fix-1 branch to be deleted, got %s", out)
 	}
 }
 
@@ -1273,9 +1387,21 @@ PY
   fi
   exit 0
 fi
+if [ "$1" = "pr" ] && [ "$2" = "close" ]; then
+  exit 0
+fi
 exit 1
 `, logPath, statePath, statePath, statePath)
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
 }
