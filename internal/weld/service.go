@@ -632,8 +632,12 @@ func (s *Service) Ship(branch string, tree bool, mode SyncMode) (*ShipResult, er
 		return nil, err
 	}
 
-	if err := s.Sync(targetBranch, tree, mode); err != nil {
+	if needed, err := s.shipNeedsSync(targetBranch, tree, mode); err != nil {
 		return nil, err
+	} else if needed {
+		if err := s.Sync(targetBranch, tree, mode); err != nil {
+			return nil, err
+		}
 	}
 	s.stepf("shipping %s (%s)", targetBranch, syncScopeLabel(tree))
 
@@ -682,6 +686,35 @@ func (s *Service) Ship(branch string, tree bool, mode SyncMode) (*ShipResult, er
 	}
 	s.stepf("ship complete")
 	return result, nil
+}
+
+func (s *Service) shipNeedsSync(branch string, tree bool, mode SyncMode) (bool, error) {
+	conflicted, err := s.inRebaseConflict()
+	if err != nil {
+		return false, err
+	}
+	if mode != SyncModeLocal && s.remoteEnabled() && strings.TrimSpace(s.remoteName()) != "" && s.repo.HasRemote(s.remoteName()) {
+		if err := s.repo.FetchQuiet(s.remoteName()); err != nil {
+			return false, err
+		}
+	}
+	order, err := s.syncOrder(branch, tree)
+	if err != nil {
+		return false, err
+	}
+	actions, err := s.statusSyncActionsForScope(order)
+	if err != nil {
+		return false, err
+	}
+	for _, item := range order {
+		if item == s.rootBranch() {
+			continue
+		}
+		if conflicted || actions[item] != "none" {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (s *Service) PR(branch string, title string, body string, draft bool, web bool) (*PRResult, error) {
@@ -1112,15 +1145,11 @@ func (s *Service) statusNeedsTrackingUpdate(branch string) (bool, error) {
 	if trackingRef == "" || !s.repo.HasRef(trackingRef) || !s.repo.HasRef(s.repo.BranchRef(branch)) {
 		return false, nil
 	}
-	remoteIsAncestor, err := s.repo.IsRefAncestor(trackingRef, s.repo.BranchRef(branch))
+	_, remoteOnly, err := s.repo.UniqueTrackingCommits(branch)
 	if err != nil {
 		return false, err
 	}
-	localIsAncestor, err := s.repo.IsRefAncestor(s.repo.BranchRef(branch), trackingRef)
-	if err != nil {
-		return false, err
-	}
-	return !(remoteIsAncestor && localIsAncestor) && localIsAncestor, nil
+	return remoteOnly > 0, nil
 }
 
 func (s *Service) statusNeedsRebase(branch string) (bool, error) {

@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -400,21 +401,17 @@ func (r *Repo) UpdateLocalBranchFromTracking(branch string) error {
 		return nil
 	}
 
-	counts, err := r.Output("rev-list", "--left-right", "--count", r.BranchRef(branch)+"..."+trackingRef)
+	localOnly, remoteOnly, err := r.UniqueTrackingCommits(branch)
 	if err != nil {
 		return err
 	}
-	fields := strings.Fields(counts)
-	if len(fields) != 2 {
-		return fmt.Errorf("unexpected rev-list output %q", counts)
-	}
-	if fields[0] == "0" && fields[1] == "0" {
+	if localOnly == 0 && remoteOnly == 0 {
 		return nil
 	}
-	if fields[0] != "0" && fields[1] == "0" {
+	if localOnly > 0 && remoteOnly == 0 {
 		return nil
 	}
-	if fields[0] == "0" {
+	if localOnly == 0 && remoteOnly > 0 {
 		newOID, err := r.Output("rev-parse", trackingRef)
 		if err != nil {
 			return err
@@ -426,6 +423,33 @@ func (r *Repo) UpdateLocalBranchFromTracking(branch string) error {
 		return r.Run("update-ref", r.BranchRef(branch), newOID, oldOID)
 	}
 	return r.RebaseBranchOntoRef(branch, trackingRef)
+}
+
+func (r *Repo) UniqueTrackingCommits(branch string) (int, int, error) {
+	trackingRef, err := r.TrackingRef(branch)
+	if err != nil {
+		return 0, 0, err
+	}
+	if trackingRef == "" || !r.HasRef(trackingRef) || !r.HasRef(r.BranchRef(branch)) {
+		return 0, 0, nil
+	}
+	counts, err := r.Output("rev-list", "--left-right", "--count", "--cherry-pick", r.BranchRef(branch)+"..."+trackingRef)
+	if err != nil {
+		return 0, 0, err
+	}
+	fields := strings.Fields(counts)
+	if len(fields) != 2 {
+		return 0, 0, fmt.Errorf("unexpected rev-list output %q", counts)
+	}
+	localOnly, err := strconv.Atoi(fields[0])
+	if err != nil {
+		return 0, 0, err
+	}
+	remoteOnly, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return 0, 0, err
+	}
+	return localOnly, remoteOnly, nil
 }
 
 func (r *Repo) RebaseBranchOntoRef(branch string, targetRef string) error {
@@ -481,7 +505,7 @@ func (r *Repo) RebaseBranchOntoFrom(branch string, oldBaseOID string, newBase st
 		}
 	}()
 
-	if err := r.runGitQuietWithOutput("rebase", "--quiet", "--onto", r.BranchRef(newBase), oldBaseOID); err != nil {
+	if err := r.runGitQuietWithOutput("rebase", "--quiet", "--onto", r.BranchRef(newBase), oldBaseOID, branch); err != nil {
 		return err
 	}
 	success = true

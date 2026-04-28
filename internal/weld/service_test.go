@@ -837,9 +837,20 @@ func TestSyncFromFeaturePropagatesRemoteParentChangeAndShipPreservesIt(t *testin
 	if strings.TrimSpace(string(contents)) != "remote edit" {
 		t.Fatalf("expected feature to include updated parent contents, got %q", string(contents))
 	}
+	rangeAfterSync := runGit(t, repoDir, "log", "--oneline", "fix-1..feature")
+	if strings.Contains(rangeAfterSync, "remote edit on fix-1") {
+		t.Fatalf("expected child branch range to exclude parent commit after sync, got:\n%s", rangeAfterSync)
+	}
 
 	if _, err := svc.Ship("feature", false, SyncModeDefault); err != nil {
 		t.Fatal(err)
+	}
+	rangeLog := runGit(t, repoDir, "log", "--oneline", "fix-1..feature")
+	if strings.Contains(rangeLog, "remote edit on fix-1") {
+		t.Fatalf("expected child branch range to exclude parent commit, got:\n%s", rangeLog)
+	}
+	if !strings.Contains(rangeLog, "feature") {
+		t.Fatalf("expected child branch range to keep feature commit, got:\n%s", rangeLog)
 	}
 	verifyDir := t.TempDir()
 	runGit(t, verifyDir, "clone", remoteDir, ".")
