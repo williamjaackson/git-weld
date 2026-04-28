@@ -25,12 +25,15 @@ func TestNewBranchIsManagedWithImplicitMasterParent(t *testing.T) {
 		t.Fatalf("expected no explicit parents, got: %#v", parents)
 	}
 
-	entries, err := svc.Status()
+	entries, err := svc.Status("fix-1", false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 1 || entries[0].Branch != "fix-1" || len(entries[0].Parents) != 0 {
+	if len(entries) != 1 || entries[0].Branch != "fix-1" || len(entries[0].Upstream) != 1 || entries[0].Upstream[0] != "master" {
 		t.Fatalf("unexpected status: %+v", entries)
+	}
+	if entries[0].SyncAction != "none" || entries[0].ShipAction != "none" {
+		t.Fatalf("unexpected action state: %+v", entries[0])
 	}
 }
 
@@ -256,6 +259,10 @@ func TestShowTreeAddsDescendantsWithoutSiblingBranches(t *testing.T) {
 func TestDeletedBranchesAreAutoPrunedFromStatus(t *testing.T) {
 	repoDir := initRepo(t)
 	svc := openService(t, repoDir)
+	if err := svc.NewBranch("fix-1"); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoDir, "checkout", "master")
 	if err := svc.NewBranch("fix-2"); err != nil {
 		t.Fatal(err)
 	}
@@ -263,12 +270,161 @@ func TestDeletedBranchesAreAutoPrunedFromStatus(t *testing.T) {
 	runGit(t, repoDir, "checkout", "master")
 	runGit(t, repoDir, "branch", "-D", "fix-2")
 
-	entries, err := svc.Status()
+	entries, err := svc.Status("fix-1", false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 0 {
-		t.Fatalf("expected deleted branch metadata to be pruned, got: %+v", entries)
+	if len(entries) != 1 || entries[0].Branch != "fix-1" {
+		t.Fatalf("expected deleted branch metadata to be pruned while keeping fix-1, got: %+v", entries)
+	}
+}
+
+func TestStatusReportsUpdateAndSyncFirstForRemoteAheadBranch(t *testing.T) {
+	repoDir := initRepo(t)
+	remoteDir := t.TempDir()
+	runGit(t, remoteDir, "init", "--bare")
+	runGit(t, repoDir, "remote", "add", "origin", remoteDir)
+	runGit(t, repoDir, "push", "-u", "origin", "master")
+
+	svc := openService(t, repoDir)
+	if err := svc.NewBranch("fix-1"); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoDir, "push", "-u", "origin", "fix-1")
+
+	cloneDir := t.TempDir()
+	runGit(t, cloneDir, "clone", remoteDir, ".")
+	runGit(t, cloneDir, "config", "user.name", "Other User")
+	runGit(t, cloneDir, "config", "user.email", "other@example.com")
+	runGit(t, cloneDir, "switch", "fix-1")
+	writeFile(t, cloneDir, "remote-fix.txt", "remote fix\n")
+	runGit(t, cloneDir, "add", "remote-fix.txt")
+	runGit(t, cloneDir, "commit", "-m", "remote fix")
+	runGit(t, cloneDir, "push", "origin", "fix-1")
+
+	entries, err := svc.Status("fix-1", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("unexpected status entries: %+v", entries)
+	}
+	if entries[0].SyncAction != "update" || entries[0].ShipAction != "sync-first" {
+		t.Fatalf("unexpected status entry: %+v", entries[0])
+	}
+}
+
+func TestStatusPropagatesUpstreamUpdateToChildBranch(t *testing.T) {
+	repoDir := initRepo(t)
+	remoteDir := t.TempDir()
+	runGit(t, remoteDir, "init", "--bare")
+	runGit(t, repoDir, "remote", "add", "origin", remoteDir)
+	runGit(t, repoDir, "push", "-u", "origin", "master")
+
+	svc := openService(t, repoDir)
+	if err := svc.NewBranch("fix-1"); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, repoDir, "fix-1.txt", "base\n")
+	runGit(t, repoDir, "add", "fix-1.txt")
+	runGit(t, repoDir, "commit", "-m", "fix-1")
+	runGit(t, repoDir, "push", "-u", "origin", "fix-1")
+
+	if err := svc.Stack("feature", "fix-1", true); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, repoDir, "feature.txt", "feature\n")
+	runGit(t, repoDir, "add", "feature.txt")
+	runGit(t, repoDir, "commit", "-m", "feature")
+	runGit(t, repoDir, "push", "-u", "origin", "feature")
+
+	cloneDir := t.TempDir()
+	runGit(t, cloneDir, "clone", remoteDir, ".")
+	runGit(t, cloneDir, "config", "user.name", "Other User")
+	runGit(t, cloneDir, "config", "user.email", "other@example.com")
+	runGit(t, cloneDir, "switch", "fix-1")
+	writeFile(t, cloneDir, "fix-1.txt", "remote update\n")
+	runGit(t, cloneDir, "add", "fix-1.txt")
+	runGit(t, cloneDir, "commit", "-m", "remote update")
+	runGit(t, cloneDir, "push", "origin", "fix-1")
+
+	entries, err := svc.Status("feature", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("unexpected status entries: %+v", entries)
+	}
+	if entries[0].SyncAction != "rebase" || entries[0].ShipAction != "sync-first" {
+		t.Fatalf("unexpected propagated status entry: %+v", entries[0])
+	}
+}
+
+func TestStatusReportsDownstreamImpact(t *testing.T) {
+	repoDir := initRepo(t)
+	svc := buildBasicGraph(t, repoDir)
+
+	entries, err := svc.Status("fix-1", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("unexpected status entries: %+v", entries)
+	}
+	if !contains(entries[0].Affects, "feature") {
+		t.Fatalf("expected downstream impact to include feature, got %+v", entries[0])
+	}
+}
+
+func TestStatusShipActionIncludesUpstreamPushes(t *testing.T) {
+	repoDir := initRepo(t)
+	remoteDir := t.TempDir()
+	runGit(t, remoteDir, "init", "--bare")
+	runGit(t, repoDir, "remote", "add", "origin", remoteDir)
+	runGit(t, repoDir, "push", "-u", "origin", "master")
+
+	svc := openService(t, repoDir)
+	if err := svc.NewBranch("fix-1"); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, repoDir, "fix-1.txt", "base\n")
+	runGit(t, repoDir, "add", "fix-1.txt")
+	runGit(t, repoDir, "commit", "-m", "fix-1")
+
+	if err := svc.Stack("feature", "fix-1", true); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, repoDir, "feature.txt", "feature\n")
+	runGit(t, repoDir, "add", "feature.txt")
+	runGit(t, repoDir, "commit", "-m", "feature")
+	runGit(t, repoDir, "push", "-u", "origin", "feature")
+
+	entries, err := svc.Status("feature", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("unexpected status entries: %+v", entries)
+	}
+	if entries[0].ShipAction != "push" {
+		t.Fatalf("expected child ship status to include upstream push, got %+v", entries[0])
+	}
+}
+
+func TestStatusTreeIncludesUpstreamAndDownstreamBranches(t *testing.T) {
+	repoDir := initRepo(t)
+	svc := buildBasicGraph(t, repoDir)
+
+	entries, err := svc.Status("fix-1", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("expected tree status for fix-1 to include upstream and downstream branches, got %+v", entries)
+	}
+	branches := []string{entries[0].Branch, entries[1].Branch, entries[2].Branch}
+	if !contains(branches, "fix-1") || !contains(branches, "fix-2") || !contains(branches, "feature") {
+		t.Fatalf("unexpected status tree branches: %+v", branches)
 	}
 }
 
@@ -441,6 +597,70 @@ func TestShipDoesNotReportSyntheticDeletionWhenNothingWasDeleted(t *testing.T) {
 	}
 	if len(result.SyntheticDeleted) != 0 {
 		t.Fatalf("expected no synthetic deletions, got: %+v", result.SyntheticDeleted)
+	}
+}
+
+func TestSecondShipWithNoChangesDoesNotForcePushAgain(t *testing.T) {
+	repoDir := initRepo(t)
+	remoteDir := t.TempDir()
+	runGit(t, remoteDir, "init", "--bare")
+	runGit(t, repoDir, "remote", "add", "origin", remoteDir)
+	runGit(t, repoDir, "push", "-u", "origin", "master")
+
+	svc := buildBasicGraph(t, repoDir)
+	if _, err := svc.Ship("feature", false, SyncModeDefault); err != nil {
+		t.Fatal(err)
+	}
+	firstFeatureRemote := runGit(t, repoDir, "rev-parse", "refs/remotes/origin/feature")
+	firstSyntheticRemote := runGit(t, repoDir, "rev-parse", "refs/remotes/origin/_weld/feature")
+
+	result, err := svc.Ship("feature", false, SyncModeDefault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondFeatureRemote := runGit(t, repoDir, "rev-parse", "refs/remotes/origin/feature")
+	secondSyntheticRemote := runGit(t, repoDir, "rev-parse", "refs/remotes/origin/_weld/feature")
+
+	if firstFeatureRemote != secondFeatureRemote {
+		t.Fatalf("expected feature remote ref to stay unchanged, got %s then %s", firstFeatureRemote, secondFeatureRemote)
+	}
+	if firstSyntheticRemote != secondSyntheticRemote {
+		t.Fatalf("expected welded base remote ref to stay unchanged, got %s then %s", firstSyntheticRemote, secondSyntheticRemote)
+	}
+	if len(result.BranchesPushed) != 3 {
+		t.Fatalf("expected ship plan to still include branches, got %+v", result)
+	}
+}
+
+func TestShipWithExistingPRLeavesStatusClean(t *testing.T) {
+	repoDir := initRepo(t)
+	remoteDir := t.TempDir()
+	runGit(t, remoteDir, "init", "--bare")
+	runGit(t, repoDir, "remote", "add", "origin", remoteDir)
+	runGit(t, repoDir, "push", "-u", "origin", "master")
+	fakeBin := filepath.Join(t.TempDir(), "gh")
+	ghLog := filepath.Join(t.TempDir(), "gh.log")
+	ghState := filepath.Join(t.TempDir(), "gh.state")
+	writeFakeGH(t, fakeBin, ghLog, ghState)
+	if err := os.WriteFile(ghState, []byte("existing"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", filepath.Dir(fakeBin)+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	svc := buildBasicGraph(t, repoDir)
+	if _, err := svc.Ship("feature", false, SyncModeDefault); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := svc.Status("feature", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("unexpected status entries: %+v", entries)
+	}
+	if entries[0].SyncAction != "none" || entries[0].ShipAction != "none" {
+		t.Fatalf("expected status to be clean after ship, got %+v", entries[0])
 	}
 }
 

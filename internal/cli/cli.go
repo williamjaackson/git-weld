@@ -204,23 +204,57 @@ func (c *CLI) runShow(args []string) error {
 }
 
 func (c *CLI) runStatus(args []string) error {
-	if len(args) != 0 {
-		return errors.New("usage: git weld status")
+	positional, flags, err := parseBoolFlags(args, map[string]string{
+		"--tree": "tree",
+	})
+	if err != nil {
+		return err
+	}
+	if len(positional) > 1 {
+		return errors.New("usage: git weld status [<branch>] [--tree]")
 	}
 	svc, err := weld.Open(c.cwd)
 	if err != nil {
 		return err
 	}
-	entries, err := svc.Status()
+	branch := ""
+	if len(positional) == 1 {
+		branch = positional[0]
+	}
+	entries, err := svc.Status(branch, flags["tree"])
 	if err != nil {
 		return err
 	}
-	for _, entry := range entries {
+	for i, entry := range entries {
 		if _, err := fmt.Fprintf(c.stdout, "%s:\n", entry.Branch); err != nil {
 			return err
 		}
-		for _, parent := range entry.Parents {
-			if _, err := fmt.Fprintf(c.stdout, "  %s\n", parent); err != nil {
+		if _, err := fmt.Fprintln(c.stdout, "  upstream:"); err != nil {
+			return err
+		}
+		for _, parent := range entry.Upstream {
+			if _, err := fmt.Fprintf(c.stdout, "    - %s\n", parent); err != nil {
+				return err
+			}
+		}
+		if _, err := fmt.Fprintf(c.stdout, "  sync: %s\n", entry.SyncAction); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(c.stdout, "  ship: %s\n", entry.ShipAction); err != nil {
+			return err
+		}
+		if len(entry.Affects) > 0 {
+			if _, err := fmt.Fprintln(c.stdout, "  affects:"); err != nil {
+				return err
+			}
+			for _, downstream := range entry.Affects {
+				if _, err := fmt.Fprintf(c.stdout, "    - %s\n", downstream); err != nil {
+					return err
+				}
+			}
+		}
+		if i < len(entries)-1 {
+			if _, err := fmt.Fprintln(c.stdout); err != nil {
 				return err
 			}
 		}
@@ -456,7 +490,7 @@ func printHelp(out io.Writer) {
 	fmt.Fprintln(out, "  stack <branch> [<base>] [-c|--create]")
 	fmt.Fprintln(out, "  unstack <branch> [<base>]")
 	fmt.Fprintln(out, "  show [<branch>] [--tree]")
-	fmt.Fprintln(out, "  status")
+	fmt.Fprintln(out, "  status [<branch>] [--tree]")
 	fmt.Fprintln(out, "  diff [<branch>]")
 	fmt.Fprintln(out, "  sync [<branch>] [--tree] [--local|--remote]")
 	fmt.Fprintln(out, "  ship [<branch>] [--tree] [--local|--remote]")

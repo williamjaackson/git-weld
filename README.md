@@ -24,7 +24,7 @@ Current commands:
 - `git weld stack <branch> [<base>] [-c|--create]`
 - `git weld unstack <branch> [<base>]`
 - `git weld show [<branch>] [--tree]`
-- `git weld status`
+- `git weld status [<branch>] [--tree]`
 - `git weld diff [<branch>]`
 - `git weld sync [<branch>] [--tree] [--local|--remote]`
 - `git weld ship [<branch>] [--tree] [--local|--remote]`
@@ -82,11 +82,31 @@ Current commands:
   - `(downstream)` tree
 - descendants are rooted at the target branch only, so sibling branches under `master` are not included
 
-### `git weld status`
+### `git weld status [<branch>] [--tree]`
 
-- lists all weld-managed branches
-- shows only explicit parents
-- branches rooted directly on the configured main branch display as an empty block
+- shows status for one managed branch
+- defaults to the current branch
+- fetches the configured remote quietly before computing status, so remote-only updates are reflected without extra noise
+- `--tree` shows the target branch plus its upstream and downstream weld tree
+- shows:
+  - `upstream`
+  - `sync`
+  - `ship`
+  - `affects`
+- `upstream` lists the branch's direct parents, or the configured main branch when the root is implicit
+- `sync` shows what `git weld sync` would do for that branch, including transitive upstream changes:
+  - `none`
+  - `update`
+  - `rebase`
+  - `update+rebase`
+  - `conflicted`
+- `ship` shows what `git weld ship` would do for that branch, including upstream branches that would be pushed as part of shipping that branch:
+  - `none`
+  - `push`
+  - `force-push`
+  - `sync-first`
+  - `conflicted`
+- `affects` lists downstream branches that depend on the target branch
 
 ### `git weld diff [<branch>]`
 
@@ -99,6 +119,7 @@ Current commands:
 - updates the local branch graph
 - rebuilds welded bases as needed
 - rebases managed branches onto their current effective base
+- sync behavior is transitive through upstream branches, so a parent update will mark descendants for rebase
 - auto-prunes stale metadata for deleted branches and deleted parents
 - `--tree` also syncs descendants
 - `--local` skips all remote refresh and syncs against local refs only
@@ -113,6 +134,7 @@ Current commands:
 - pushes the minimum required real branches for the requested branch or tree
 - pushes welded bases when a multi-parent review base is required
 - refreshes existing GitHub PR bases when `gh` is available
+- ship behavior is transitive through upstream branches, so shipping a child branch may also push required parent branches first
 - deletes stale remote welded bases after PR bases have been retargeted
 - `--local` ships after a local-only sync
 - `--remote` ships after a sync that also refreshes the configured main branch

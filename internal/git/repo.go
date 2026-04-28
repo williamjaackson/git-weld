@@ -218,10 +218,17 @@ func (r *Repo) PushBranch(remote string, branch string) error {
 		return err
 	}
 	remoteRef := r.RemoteBranchRef(remote, branch)
+	localOID, err := r.Output("rev-parse", r.BranchRef(branch))
+	if err != nil {
+		return err
+	}
 	shouldTrack := !strings.HasPrefix(branch, "_weld/")
 	if !r.HasRef(remoteRef) {
 		if err := r.Run("push", remote, r.BranchRef(branch)+":"+branch); err != nil {
 			return err
+		}
+		if err := r.UpdateRef(remoteRef, localOID, ""); err != nil {
+			return fmt.Errorf("update local tracking ref %s after push: %w", remoteRef, err)
 		}
 		if shouldTrack {
 			return r.EnsureTrackingBranch(remote, branch)
@@ -236,6 +243,9 @@ func (r *Repo) PushBranch(remote string, branch string) error {
 		if err := r.Run("push", remote, r.BranchRef(branch)+":"+branch); err != nil {
 			return err
 		}
+		if err := r.UpdateRef(remoteRef, localOID, ""); err != nil {
+			return fmt.Errorf("update local tracking ref %s after push: %w", remoteRef, err)
+		}
 		if shouldTrack {
 			return r.EnsureTrackingBranch(remote, branch)
 		}
@@ -243,6 +253,9 @@ func (r *Repo) PushBranch(remote string, branch string) error {
 	}
 	if err := r.Run("push", "--force-with-lease="+branch, remote, r.BranchRef(branch)+":"+branch); err != nil {
 		return err
+	}
+	if err := r.UpdateRef(remoteRef, localOID, ""); err != nil {
+		return fmt.Errorf("update local tracking ref %s after force-push: %w", remoteRef, err)
 	}
 	if shouldTrack {
 		return r.EnsureTrackingBranch(remote, branch)
@@ -269,7 +282,13 @@ func (r *Repo) DeleteRemoteBranch(remote string, branch string) (bool, error) {
 	if !exists {
 		return false, nil
 	}
-	return true, r.Run("push", remote, "--delete", branch)
+	if err := r.Run("push", remote, "--delete", branch); err != nil {
+		return false, err
+	}
+	if err := r.DeleteRef(r.RemoteBranchRef(remote, branch), ""); err != nil {
+		return false, fmt.Errorf("delete local tracking ref %s: %w", r.RemoteBranchRef(remote, branch), err)
+	}
+	return true, nil
 }
 
 func (r *Repo) UpdateLocalRoot(remote string, root string) error {
@@ -313,6 +332,13 @@ func (r *Repo) Fetch(remote string) error {
 		return err
 	}
 	return r.Run("fetch", remote)
+}
+
+func (r *Repo) FetchQuiet(remote string) error {
+	if err := r.RequireRemote(remote); err != nil {
+		return err
+	}
+	return r.RunQuiet("fetch", "--quiet", remote)
 }
 
 func (r *Repo) TrackingRef(branch string) (string, error) {
@@ -421,7 +447,7 @@ func (r *Repo) RebaseBranchOntoRef(branch string, targetRef string) error {
 		}
 	}()
 
-	if err := r.Run("rebase", "--quiet", targetRef); err != nil {
+	if err := r.runGitQuietWithOutput("rebase", "--quiet", targetRef); err != nil {
 		return fmt.Errorf("rebase %s onto tracking branch: %w", branch, err)
 	}
 	success = true
@@ -455,11 +481,16 @@ func (r *Repo) RebaseBranchOntoFrom(branch string, oldBaseOID string, newBase st
 		}
 	}()
 
-	if err := r.Run("rebase", "--quiet", "--onto", r.BranchRef(newBase), oldBaseOID); err != nil {
+	if err := r.runGitQuietWithOutput("rebase", "--quiet", "--onto", r.BranchRef(newBase), oldBaseOID); err != nil {
 		return err
 	}
 	success = true
 	return nil
+}
+
+func (r *Repo) runGitQuietWithOutput(args ...string) error {
+	cmdArgs := append([]string{"-c", "advice.skippedCherryPicks=false"}, args...)
+	return r.Run(cmdArgs...)
 }
 
 func (r *Repo) isRefAncestor(ancestorRef string, descendantRef string) (bool, error) {
@@ -473,6 +504,10 @@ func (r *Repo) isRefAncestor(ancestorRef string, descendantRef string) (bool, er
 		return false, err
 	}
 	return true, nil
+}
+
+func (r *Repo) IsRefAncestor(ancestorRef string, descendantRef string) (bool, error) {
+	return r.isRefAncestor(ancestorRef, descendantRef)
 }
 
 func (r *Repo) Diff(base string, branch string) (string, error) {
@@ -513,6 +548,17 @@ func (r *Repo) RebuildSyntheticBase(branch string, parents []string) (string, er
 	}
 
 	return synthetic, nil
+}
+
+func (r *Repo) CommitParentOIDs(ref string) ([]string, error) {
+	out, err := r.Output("show", "--no-patch", "--format=%P", ref)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(out) == "" {
+		return nil, nil
+	}
+	return strings.Fields(out), nil
 }
 
 func encodeName(value string) string {

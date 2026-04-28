@@ -20,8 +20,11 @@ type Service struct {
 }
 
 type StatusEntry struct {
-	Branch  string
-	Parents []string
+	Branch     string
+	Upstream   []string
+	SyncAction string
+	ShipAction string
+	Affects    []string
 }
 
 type ShipResult struct {
@@ -423,27 +426,79 @@ func (s *Service) Show(branch string, includeChildren bool) (string, error) {
 	return strings.Join(lines, "\n"), nil
 }
 
-func (s *Service) Status() ([]StatusEntry, error) {
+func (s *Service) Status(branch string, tree bool) ([]StatusEntry, error) {
 	if err := s.reconcileMetadata(); err != nil {
 		return nil, err
 	}
-
-	branches, err := s.meta.ManagedBranches()
+	if s.remoteEnabled() && strings.TrimSpace(s.remoteName()) != "" && s.repo.HasRemote(s.remoteName()) {
+		if err := s.repo.FetchQuiet(s.remoteName()); err != nil {
+			return nil, err
+		}
+	}
+	conflicted, err := s.inRebaseConflict()
 	if err != nil {
 		return nil, err
 	}
-	entries := make([]StatusEntry, 0, len(branches))
-	for _, branch := range branches {
-		if !s.repo.BranchExists(branch) {
-			continue
-		}
-		parents, err := s.meta.Parents(branch)
+
+	targetBranch := ""
+	if branch != "" {
+		targetBranch, err = s.repo.ResolveBranch(branch)
 		if err != nil {
 			return nil, err
 		}
-		entries = append(entries, StatusEntry{Branch: branch, Parents: parents})
+		if err := s.requireManagedBranch(targetBranch); err != nil {
+			return nil, err
+		}
+	} else {
+		targetBranch, err = s.repo.CurrentBranch()
+		if err != nil {
+			return nil, err
+		}
+		if err := s.requireManagedBranch(targetBranch); err != nil {
+			return nil, err
+		}
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Branch < entries[j].Branch })
+	actionScope, err := s.syncOrder(targetBranch, tree)
+	if err != nil {
+		return nil, err
+	}
+	syncActions, err := s.statusSyncActionsForScope(actionScope)
+	if err != nil {
+		return nil, err
+	}
+	displayScope := actionScope
+	if !tree {
+		displayScope = []string{targetBranch}
+	}
+	entries := make([]StatusEntry, 0, len(displayScope))
+	for _, item := range displayScope {
+		if item == s.rootBranch() || !s.repo.BranchExists(item) {
+			continue
+		}
+		parents, err := s.meta.Parents(item)
+		if err != nil {
+			return nil, err
+		}
+		upstream := append([]string{}, parents...)
+		if len(upstream) == 0 {
+			upstream = []string{s.rootBranch()}
+		}
+		shipAction, err := s.statusShipAction(item, conflicted, syncActions)
+		if err != nil {
+			return nil, err
+		}
+		affects, err := s.descendants(item)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, StatusEntry{
+			Branch:     item,
+			Upstream:   upstream,
+			SyncAction: syncActions[item],
+			ShipAction: shipAction,
+			Affects:    affects,
+		})
+	}
 	return entries, nil
 }
 
@@ -544,7 +599,11 @@ func (s *Service) Sync(branch string, tree bool, mode SyncMode) error {
 			s.stepf("skipping %s; already up to date", item)
 			continue
 		}
-		s.stepf("rebasing %s onto %s", item, base)
+		if base == s.repo.SyntheticBranchName(item) {
+			s.stepf("rebasing %s onto welded base", item)
+		} else {
+			s.stepf("rebasing %s onto %s", item, base)
+		}
 		if err := s.repo.RebaseBranchOntoFrom(item, oldBaseOID, base); err != nil {
 			return fmt.Errorf("sync %s: %w", item, err)
 		}
@@ -724,6 +783,11 @@ func (s *Service) ensureEffectiveBase(branch string) (string, error) {
 		}
 		return parents[0], nil
 	default:
+		if reusable, err := s.syntheticBaseReusable(branch, parents); err != nil {
+			return "", err
+		} else if reusable {
+			return s.repo.SyntheticBranchName(branch), nil
+		}
 		s.stepf("rebuilding welded base")
 		return s.repo.RebuildSyntheticBase(branch, parents)
 	}
@@ -910,6 +974,217 @@ func syncScopeLabel(tree bool) string {
 		return "upstream + downstream"
 	}
 	return "upstream"
+}
+
+func (s *Service) inRebaseConflict() (bool, error) {
+	return s.repo.HasRef("REBASE_HEAD"), nil
+}
+
+func (s *Service) statusSyncAction(branch string, conflicted bool) (string, error) {
+	if conflicted {
+		return "conflicted", nil
+	}
+	order, err := s.syncOrder(branch, false)
+	if err != nil {
+		return "", err
+	}
+	actions, err := s.statusSyncActionsForScope(order)
+	if err != nil {
+		return "", err
+	}
+	return actions[branch], nil
+}
+
+func (s *Service) statusShipAction(branch string, conflicted bool, syncActions map[string]string) (string, error) {
+	if conflicted {
+		return "conflicted", nil
+	}
+	order, err := s.syncOrder(branch, false)
+	if err != nil {
+		return "", err
+	}
+	aggregate := "none"
+	for _, item := range order {
+		if item == s.rootBranch() {
+			continue
+		}
+		if syncActions[item] != "none" {
+			return "sync-first", nil
+		}
+		action, err := s.statusDirectShipAction(item)
+		if err != nil {
+			return "", err
+		}
+		switch action {
+		case "force-push":
+			aggregate = "force-push"
+		case "push":
+			if aggregate == "none" {
+				aggregate = "push"
+			}
+		case "sync-first":
+			return "sync-first", nil
+		}
+	}
+	return aggregate, nil
+}
+
+func (s *Service) statusDirectShipAction(branch string) (string, error) {
+	if !s.remoteEnabled() || strings.TrimSpace(s.remoteName()) == "" || !s.repo.HasRemote(s.remoteName()) {
+		return "none", nil
+	}
+	exists, err := s.repo.RemoteBranchExists(s.remoteName(), branch)
+	if err != nil {
+		return "", err
+	}
+	if !exists {
+		return "push", nil
+	}
+	remoteRef := s.repo.RemoteBranchRef(s.remoteName(), branch)
+	localRef := s.repo.BranchRef(branch)
+	remoteIsAncestor, err := s.repo.IsRefAncestor(remoteRef, localRef)
+	if err != nil {
+		return "", err
+	}
+	localIsAncestor, err := s.repo.IsRefAncestor(localRef, remoteRef)
+	if err != nil {
+		return "", err
+	}
+	switch {
+	case remoteIsAncestor && localIsAncestor:
+		return "none", nil
+	case remoteIsAncestor:
+		return "push", nil
+	case localIsAncestor:
+		return "sync-first", nil
+	default:
+		return "force-push", nil
+	}
+}
+
+func (s *Service) statusSyncActionsForScope(order []string) (map[string]string, error) {
+	changed := map[string]bool{}
+	actions := map[string]string{}
+	for _, item := range order {
+		if item == s.rootBranch() {
+			continue
+		}
+		update, err := s.statusNeedsTrackingUpdate(item)
+		if err != nil {
+			return nil, err
+		}
+		rebase, err := s.statusNeedsRebaseWithChangedAncestors(item, changed)
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case update && rebase:
+			actions[item] = "update+rebase"
+		case update:
+			actions[item] = "update"
+		case rebase:
+			actions[item] = "rebase"
+		default:
+			actions[item] = "none"
+		}
+		changed[item] = update || rebase
+	}
+	return actions, nil
+}
+
+func (s *Service) statusNeedsTrackingUpdate(branch string) (bool, error) {
+	if !s.remoteEnabled() || strings.TrimSpace(s.remoteName()) == "" || !s.repo.HasRemote(s.remoteName()) {
+		return false, nil
+	}
+	trackingRef, err := s.repo.TrackingRef(branch)
+	if err != nil {
+		return false, err
+	}
+	if trackingRef == "" {
+		if err := s.repo.EnsureTrackingBranchIfRemoteExists(s.remoteName(), branch); err != nil {
+			return false, err
+		}
+		trackingRef, err = s.repo.TrackingRef(branch)
+		if err != nil {
+			return false, err
+		}
+	}
+	if trackingRef == "" || !s.repo.HasRef(trackingRef) || !s.repo.HasRef(s.repo.BranchRef(branch)) {
+		return false, nil
+	}
+	remoteIsAncestor, err := s.repo.IsRefAncestor(trackingRef, s.repo.BranchRef(branch))
+	if err != nil {
+		return false, err
+	}
+	localIsAncestor, err := s.repo.IsRefAncestor(s.repo.BranchRef(branch), trackingRef)
+	if err != nil {
+		return false, err
+	}
+	return !(remoteIsAncestor && localIsAncestor) && localIsAncestor, nil
+}
+
+func (s *Service) statusNeedsRebase(branch string) (bool, error) {
+	base, err := s.currentEffectiveBase(branch)
+	if err != nil {
+		return false, nil
+	}
+	headOID, err := s.repo.BranchOID(branch)
+	if err != nil {
+		return false, err
+	}
+	baseOID, err := s.repo.BranchOID(base)
+	if err != nil {
+		return false, err
+	}
+	mergeBase, err := s.repo.Output("merge-base", s.repo.BranchRef(branch), s.repo.BranchRef(base))
+	if err != nil {
+		return false, err
+	}
+	if strings.TrimSpace(headOID) == strings.TrimSpace(baseOID) {
+		return false, nil
+	}
+	return strings.TrimSpace(mergeBase) != strings.TrimSpace(baseOID), nil
+}
+
+func (s *Service) statusNeedsRebaseWithChangedAncestors(branch string, changed map[string]bool) (bool, error) {
+	parents, err := s.meta.Parents(branch)
+	if err != nil {
+		return false, err
+	}
+	for _, parent := range parents {
+		if changed[parent] {
+			return true, nil
+		}
+	}
+	return s.statusNeedsRebase(branch)
+}
+
+func (s *Service) syntheticBaseReusable(branch string, parents []string) (bool, error) {
+	synthetic := s.repo.SyntheticBranchName(branch)
+	if !s.repo.BranchExists(synthetic) {
+		return false, nil
+	}
+	expected := make([]string, 0, len(parents))
+	for _, parent := range parents {
+		oid, err := s.repo.BranchOID(parent)
+		if err != nil {
+			return false, err
+		}
+		expected = append(expected, oid)
+	}
+	actual, err := s.repo.CommitParentOIDs(s.repo.BranchRef(synthetic))
+	if err != nil {
+		return false, err
+	}
+	if len(actual) != len(expected) {
+		return false, nil
+	}
+	for i := range expected {
+		if actual[i] != expected[i] {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func (s *Service) snapshotRefsForSync(order []string) ([]refSnapshot, error) {
@@ -1159,10 +1434,7 @@ func (s *Service) prBase(branch string) (string, error) {
 		}
 		return parents[0], nil
 	}
-	if _, err := s.ensureEffectiveBase(branch); err != nil {
-		return "", err
-	}
-	return s.repo.SyntheticBranchName(branch), nil
+	return s.currentEffectiveBase(branch)
 }
 
 func (s *Service) syncBranchToCurrentBase(branch string, oldBaseOID string) error {
