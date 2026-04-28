@@ -6,6 +6,18 @@ It is designed for workflows where a branch can depend on multiple sibling branc
 
 ## Getting Started
 
+On a new macOS machine with Homebrew, install Go first:
+
+```bash
+brew install go
+```
+
+If you do not already have Apple command line tools installed, install them too:
+
+```bash
+xcode-select --install
+```
+
 Clone the repo:
 
 ```bash
