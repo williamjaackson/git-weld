@@ -36,6 +36,9 @@ func TestHelpOmitsDoctorAndCleanup(t *testing.T) {
 	if !bytes.Contains(out.Bytes(), []byte("init")) || !bytes.Contains(out.Bytes(), []byte("beside")) || !bytes.Contains(out.Bytes(), []byte("prepend")) {
 		t.Fatalf("expected init command in help output:\n%s", text)
 	}
+	if !bytes.Contains(out.Bytes(), []byte("drop")) || !bytes.Contains(out.Bytes(), []byte("help")) || !bytes.Contains(out.Bytes(), []byte("version")) {
+		t.Fatalf("expected full command list in help output:\n%s", text)
+	}
 }
 
 func TestParsePRArgs(t *testing.T) {
