@@ -51,6 +51,10 @@ func (c *CLI) run(args []string) error {
 		return c.runInit(args[1:])
 	case "stack":
 		return c.runStack(args[1:])
+	case "beside":
+		return c.runBeside(args[1:])
+	case "prepend":
+		return c.runPrepend(args[1:])
 	case "unstack":
 		return c.runUnstack(args[1:])
 	case "show":
@@ -173,6 +177,34 @@ func (c *CLI) runUnstack(args []string) error {
 	}
 	c.bindReporter(svc)
 	return svc.Unstack(args[0], base)
+}
+
+func (c *CLI) runBeside(args []string) error {
+	if len(args) != 2 {
+		return errors.New("usage: git weld beside <target> <source>")
+	}
+	svc, err := weld.Open(c.cwd)
+	if err != nil {
+		return err
+	}
+	c.bindReporter(svc)
+	return svc.Beside(args[0], args[1])
+}
+
+func (c *CLI) runPrepend(args []string) error {
+	positional, flags, values, err := parsePrependArgs(args)
+	if err != nil {
+		return err
+	}
+	if len(positional) != 1 {
+		return errors.New("usage: git weld prepend [-c|--create] <branch> [--beside <branch>]")
+	}
+	svc, err := weld.Open(c.cwd)
+	if err != nil {
+		return err
+	}
+	c.bindReporter(svc)
+	return svc.Prepend(positional[0], values["beside"], flags["create"])
 }
 
 func (c *CLI) runShow(args []string) error {
@@ -394,6 +426,35 @@ func parseInitArgs(args []string) (string, string, bool, bool, error) {
 	return mainBranch, remoteName, remoteDisabled, interactive, nil
 }
 
+func parsePrependArgs(args []string) ([]string, map[string]bool, map[string]string, error) {
+	flags := map[string]bool{"create": false}
+	values := map[string]string{"beside": ""}
+	positional := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch arg {
+		case "-c", "--create":
+			flags["create"] = true
+		case "--beside":
+			i++
+			if i >= len(args) {
+				return nil, nil, nil, errors.New("usage: git weld prepend [-c|--create] <branch> [--beside <branch>]")
+			}
+			values["beside"] = args[i]
+		default:
+			if strings.HasPrefix(arg, "--beside=") {
+				values["beside"] = strings.TrimPrefix(arg, "--beside=")
+				continue
+			}
+			if strings.HasPrefix(arg, "-") {
+				return nil, nil, nil, fmt.Errorf("unknown flag %q", arg)
+			}
+			positional = append(positional, arg)
+		}
+	}
+	return positional, flags, values, nil
+}
+
 func (c *CLI) runPR(args []string) error {
 	branch, title, body, draft, web, err := parsePRArgs(args)
 	if err != nil {
@@ -488,6 +549,8 @@ func printHelp(out io.Writer) {
 	fmt.Fprintln(out, "  new <branch>")
 	fmt.Fprintln(out, "  init [--main <branch>] [--remote <remote>] [--no-remote]")
 	fmt.Fprintln(out, "  stack <branch> [<base>] [-c|--create]")
+	fmt.Fprintln(out, "  beside <target> <source>")
+	fmt.Fprintln(out, "  prepend [-c|--create] <branch> [--beside <branch>]")
 	fmt.Fprintln(out, "  unstack <branch> [<base>]")
 	fmt.Fprintln(out, "  show [<branch>] [--tree]")
 	fmt.Fprintln(out, "  status [<branch>] [--tree]")

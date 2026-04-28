@@ -33,7 +33,7 @@ func TestHelpOmitsDoctorAndCleanup(t *testing.T) {
 	if !bytes.Contains(out.Bytes(), []byte("ship")) || !bytes.Contains(out.Bytes(), []byte("pr")) {
 		t.Fatalf("expected phase 2 commands in help output:\n%s", text)
 	}
-	if !bytes.Contains(out.Bytes(), []byte("init")) {
+	if !bytes.Contains(out.Bytes(), []byte("init")) || !bytes.Contains(out.Bytes(), []byte("beside")) || !bytes.Contains(out.Bytes(), []byte("prepend")) {
 		t.Fatalf("expected init command in help output:\n%s", text)
 	}
 }
@@ -91,5 +91,18 @@ func TestParseInitArgs(t *testing.T) {
 	}
 	if mainBranch != "" || remoteName != "" || !remoteDisabled || interactive {
 		t.Fatalf("unexpected parsed init args: main=%q remote=%q disabled=%v interactive=%v", mainBranch, remoteName, remoteDisabled, interactive)
+	}
+}
+
+func TestParsePrependArgs(t *testing.T) {
+	positional, flags, values, err := parsePrependArgs([]string{"-c", "fix-2", "--beside", "fix-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(positional) != 1 || positional[0] != "fix-2" {
+		t.Fatalf("unexpected positional args: %#v", positional)
+	}
+	if !flags["create"] || values["beside"] != "fix-1" {
+		t.Fatalf("unexpected parsed prepend args: flags=%v values=%v", flags, values)
 	}
 }

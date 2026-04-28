@@ -61,6 +61,38 @@ func TestStackOnMasterRootedBranchReplacesImplicitMaster(t *testing.T) {
 	}
 }
 
+func TestBesideCopiesDirectParents(t *testing.T) {
+	repoDir := initRepo(t)
+	svc := openService(t, repoDir)
+	if err := svc.NewBranch("fix-1"); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoDir, "checkout", "fix-1")
+	writeFile(t, repoDir, "fix1.txt", "fix1\n")
+	runGit(t, repoDir, "add", "fix1.txt")
+	runGit(t, repoDir, "commit", "-m", "fix-1")
+
+	if err := svc.Stack("feature", "fix-1", true); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoDir, "checkout", "master")
+	if err := svc.NewBranch("fix-2"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.Beside("fix-2", "feature"); err != nil {
+		t.Fatal(err)
+	}
+
+	parents, err := svc.meta.Parents("fix-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parents) != 1 || parents[0] != "fix-1" {
+		t.Fatalf("expected fix-2 to inherit feature parents, got %#v", parents)
+	}
+}
+
 func TestStackCreateSwitchesBranches(t *testing.T) {
 	repoDir := initRepo(t)
 	svc := openService(t, repoDir)
@@ -155,6 +187,80 @@ func TestUnstackLastParentFallsBackToImplicitMaster(t *testing.T) {
 	}
 	if len(parents) != 0 {
 		t.Fatalf("expected branch to fall back to master, got: %#v", parents)
+	}
+}
+
+func TestPrependInsertsBranchAboveCurrentBranch(t *testing.T) {
+	repoDir := initRepo(t)
+	svc := openService(t, repoDir)
+	if err := svc.NewBranch("fix-1"); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, repoDir, "fix1.txt", "fix1\n")
+	runGit(t, repoDir, "add", "fix1.txt")
+	runGit(t, repoDir, "commit", "-m", "fix-1")
+
+	if err := svc.Stack("feature", "fix-1", true); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, repoDir, "feature.txt", "feature\n")
+	runGit(t, repoDir, "add", "feature.txt")
+	runGit(t, repoDir, "commit", "-m", "feature")
+
+	if err := svc.Prepend("mid", "", false); err != nil {
+		t.Fatal(err)
+	}
+
+	midParents, err := svc.meta.Parents("mid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(midParents) != 1 || midParents[0] != "fix-1" {
+		t.Fatalf("expected mid to inherit feature parents, got %#v", midParents)
+	}
+	featureParents, err := svc.meta.Parents("feature")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(featureParents) != 1 || featureParents[0] != "mid" {
+		t.Fatalf("expected feature to depend only on mid, got %#v", featureParents)
+	}
+}
+
+func TestPrependBesideAddsSiblingParent(t *testing.T) {
+	repoDir := initRepo(t)
+	svc := openService(t, repoDir)
+	if err := svc.NewBranch("fix-1"); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, repoDir, "fix1.txt", "fix1\n")
+	runGit(t, repoDir, "add", "fix1.txt")
+	runGit(t, repoDir, "commit", "-m", "fix-1")
+
+	if err := svc.Stack("feature", "fix-1", true); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, repoDir, "feature.txt", "feature\n")
+	runGit(t, repoDir, "add", "feature.txt")
+	runGit(t, repoDir, "commit", "-m", "feature")
+
+	if err := svc.Prepend("fix-2", "fix-1", false); err != nil {
+		t.Fatal(err)
+	}
+
+	fix2Parents, err := svc.meta.Parents("fix-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fix2Parents) != 0 {
+		t.Fatalf("expected fix-2 to inherit implicit root from fix-1, got %#v", fix2Parents)
+	}
+	featureParents, err := svc.meta.Parents("feature")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(featureParents) != 2 || featureParents[0] != "fix-1" || featureParents[1] != "fix-2" {
+		t.Fatalf("expected feature to depend on fix-1 and fix-2, got %#v", featureParents)
 	}
 }
 
@@ -493,6 +599,17 @@ func TestShipPushesBranchesAndSyntheticBase(t *testing.T) {
 	if !contains(result.PRBasesUpdated, "feature") {
 		t.Fatalf("expected PR base refresh for feature: %+v", result)
 	}
+	logBytes, err := os.ReadFile(ghLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logText := string(logBytes)
+	if !strings.Contains(logText, "pr edit 42 --base _weld/feature --body") {
+		t.Fatalf("expected ship to refresh PR body as well as base, got:\n%s", logText)
+	}
+	if !strings.Contains(logText, "<summary><strong>Branch Tree</strong></summary>") {
+		t.Fatalf("expected weld tree section during ship PR refresh, got:\n%s", logText)
+	}
 
 	if runGit(t, repoDir, "ls-remote", "--heads", "origin", "feature") == "" {
 		t.Fatal("expected feature on remote")
@@ -531,8 +648,17 @@ func TestPRCreatesOrRefreshesUsingGH(t *testing.T) {
 	if !strings.Contains(logText, "pr create --base _weld/feature --head feature --title My Title --body Body text --draft") {
 		t.Fatalf("expected gh create call, got:\n%s", logText)
 	}
-	if !strings.Contains(logText, "pr edit 42 --base _weld/feature --title My Title --body Body text") {
+	if !strings.Contains(logText, "pr edit 42 --base _weld/feature --title My Title --body") {
 		t.Fatalf("expected gh edit call, got:\n%s", logText)
+	}
+	if !strings.Contains(logText, "<summary><strong>Branch Tree</strong></summary>") {
+		t.Fatalf("expected weld tree summary in PR body, got:\n%s", logText)
+	}
+	if !strings.Contains(logText, "- [feature #42](https://example.test/pr/42)") || !strings.Contains(logText, "  - upstream") || !strings.Contains(logText, "  - downstream") {
+		t.Fatalf("expected weld stack section in PR body, got:\n%s", logText)
+	}
+	if strings.Contains(logText, "```") {
+		t.Fatalf("expected PR body to avoid code blocks, got:\n%s", logText)
 	}
 	if !strings.Contains(logText, "pr view 42 --web") {
 		t.Fatalf("expected gh web call, got:\n%s", logText)
@@ -1094,6 +1220,7 @@ func writeFakeGH(t *testing.T, path string, logPath string, statePath string) {
 	t.Helper()
 	script := fmt.Sprintf(`#!/bin/sh
 echo "$@" >> %s
+BODY_FILE=%s.body
 if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
   if [ -f %s ]; then
     echo '[{"number":42,"url":"https://example.test/pr/42","baseRefName":"_weld/feature"}]'
@@ -1104,17 +1231,50 @@ if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
 fi
 if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
   touch %s
+  body=""
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--body" ]; then
+      shift
+      body="$1"
+      break
+    fi
+    shift
+  done
+  if [ -n "$body" ]; then
+    printf '%%s' "$body" > "$BODY_FILE"
+  else
+    printf 'Filled body' > "$BODY_FILE"
+  fi
   echo "https://example.test/pr/42"
   exit 0
 fi
 if [ "$1" = "pr" ] && [ "$2" = "edit" ]; then
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--body" ]; then
+      shift
+      printf '%%s' "$1" > "$BODY_FILE"
+      break
+    fi
+    shift
+  done
   exit 0
 fi
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  if [ "$4" = "--json" ]; then
+    body=""
+    if [ -f "$BODY_FILE" ]; then
+      body=$(cat "$BODY_FILE")
+    fi
+    BODY="$body" python3 - <<'PY'
+import json, os
+print(json.dumps({"number":42,"url":"https://example.test/pr/42","baseRefName":"_weld/feature","body":os.environ.get("BODY","")}))
+PY
+    exit 0
+  fi
   exit 0
 fi
 exit 1
-`, logPath, statePath, statePath)
+`, logPath, statePath, statePath, statePath)
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}

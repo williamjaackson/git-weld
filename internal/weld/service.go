@@ -214,7 +214,7 @@ func (s *Service) NewBranch(branch string) error {
 		return fmt.Errorf("root branch %q does not exist", s.rootBranch())
 	}
 	s.stepf("creating branch %s from %s", branch, s.rootBranch())
-	if err := s.createBranchPreservingChanges(branch, s.rootBranch()); err != nil {
+	if err := s.createBranchPreservingChanges(branch, s.rootBranch(), true); err != nil {
 		return err
 	}
 	s.stepf("tracking %s with implicit parent %s", branch, s.rootBranch())
@@ -257,7 +257,7 @@ func (s *Service) Stack(branch string, base string, create bool) error {
 			return fmt.Errorf("branch %q already exists", targetBranch)
 		}
 		s.stepf("creating branch %s from %s", targetBranch, base)
-		if err := s.createBranchPreservingChanges(targetBranch, base); err != nil {
+		if err := s.createBranchPreservingChanges(targetBranch, base, true); err != nil {
 			return err
 		}
 		if base == s.rootBranch() {
@@ -298,7 +298,10 @@ func (s *Service) Stack(branch string, base string, create bool) error {
 	return s.syncBranchToCurrentBase(targetBranch, oldBaseOIDs[targetBranch])
 }
 
-func (s *Service) createBranchPreservingChanges(branch string, base string) (err error) {
+func (s *Service) createBranchPreservingChanges(branch string, base string, switchToNew bool) (err error) {
+	if !switchToNew {
+		return s.repo.CreateBranch(branch, base, false)
+	}
 	originalBranch, err := s.repo.CurrentBranch()
 	if err != nil {
 		return err
@@ -385,6 +388,145 @@ func (s *Service) Unstack(branch string, base string) error {
 		return err
 	}
 	return nil
+}
+
+func (s *Service) Beside(target string, source string) error {
+	oldBaseOIDs, err := s.snapshotEffectiveBaseOIDs()
+	if err != nil {
+		return err
+	}
+	if err := s.reconcileMetadata(); err != nil {
+		return err
+	}
+
+	targetBranch, err := s.repo.ResolveBranch(target)
+	if err != nil {
+		return err
+	}
+	sourceBranch, err := s.repo.ResolveBranch(source)
+	if err != nil {
+		return err
+	}
+	if targetBranch == sourceBranch {
+		return errors.New("target and source branch must be different")
+	}
+	if err := s.requireManagedBranch(targetBranch); err != nil {
+		return err
+	}
+	if err := s.requireManagedOrRoot(sourceBranch); err != nil {
+		return err
+	}
+
+	sourceParents, err := s.meta.Parents(sourceBranch)
+	if err != nil {
+		return err
+	}
+	if len(sourceParents) == 0 {
+		s.stepf("no explicit parents to add from %s to %s", sourceBranch, targetBranch)
+		return nil
+	}
+	for _, parent := range sourceParents {
+		if parent == targetBranch {
+			return errors.New("branch cannot depend on itself")
+		}
+		if ok, err := s.hasPath(parent, targetBranch); err != nil {
+			return err
+		} else if ok {
+			return fmt.Errorf("adding parents from %q to %q would create a cycle", sourceBranch, targetBranch)
+		}
+	}
+
+	targetParents, err := s.meta.Parents(targetBranch)
+	if err != nil {
+		return err
+	}
+	s.stepf("adding parents of %s to %s", sourceBranch, targetBranch)
+	if err := s.meta.SetParents(targetBranch, append(targetParents, sourceParents...)); err != nil {
+		return err
+	}
+	return s.syncBranchToCurrentBase(targetBranch, oldBaseOIDs[targetBranch])
+}
+
+func (s *Service) Prepend(branch string, beside string, switchToNew bool) error {
+	oldBaseOIDs, err := s.snapshotEffectiveBaseOIDs()
+	if err != nil {
+		return err
+	}
+	if err := s.reconcileMetadata(); err != nil {
+		return err
+	}
+
+	targetBranch, err := s.repo.CurrentBranch()
+	if err != nil {
+		return err
+	}
+	if err := s.requireManagedBranch(targetBranch); err != nil {
+		return err
+	}
+	newBranch := strings.TrimSpace(branch)
+	if newBranch == "" {
+		return errors.New("branch name is required")
+	}
+	if s.repo.BranchExists(newBranch) {
+		return fmt.Errorf("branch %q already exists", newBranch)
+	}
+
+	sourceBranch := targetBranch
+	replaceParents := true
+	if strings.TrimSpace(beside) != "" {
+		sourceBranch, err = s.repo.ResolveBranch(beside)
+		if err != nil {
+			return err
+		}
+		if err := s.requireManagedOrRoot(sourceBranch); err != nil {
+			return err
+		}
+		ok, err := s.hasPath(targetBranch, sourceBranch)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("branch %q is not upstream from %q", sourceBranch, targetBranch)
+		}
+		replaceParents = false
+	}
+
+	inheritedParents, err := s.meta.Parents(sourceBranch)
+	if err != nil {
+		return err
+	}
+	createBase, err := s.currentEffectiveBase(sourceBranch)
+	if err != nil {
+		return err
+	}
+	s.stepf("creating branch %s from %s", newBranch, createBase)
+	if err := s.createBranchPreservingChanges(newBranch, createBase, switchToNew); err != nil {
+		return err
+	}
+	if len(inheritedParents) == 0 {
+		s.stepf("tracking %s with implicit parent %s", newBranch, s.rootBranch())
+		if err := s.meta.MarkManaged(newBranch); err != nil {
+			return err
+		}
+	} else {
+		s.stepf("adding parents of %s to %s", sourceBranch, newBranch)
+		if err := s.meta.SetParents(newBranch, inheritedParents); err != nil {
+			return err
+		}
+	}
+
+	if replaceParents {
+		s.stepf("replacing parents of %s with %s", targetBranch, newBranch)
+		if err := s.meta.SetParents(targetBranch, []string{newBranch}); err != nil {
+			return err
+		}
+	} else {
+		s.stepf("adding parent %s to %s", newBranch, targetBranch)
+		if err := s.meta.AddParent(targetBranch, newBranch); err != nil {
+			return err
+		}
+	}
+	return s.syncBranchToCurrentBase(targetBranch, oldBaseOIDs[targetBranch])
 }
 
 func (s *Service) Show(branch string, includeChildren bool) (string, error) {
@@ -771,14 +913,25 @@ func (s *Service) PR(branch string, title string, body string, draft bool, web b
 		}
 	}
 
+	currentBody := body
+	if currentBody == "" {
+		existingDetails, err := s.viewPR(existing.Number)
+		if err != nil {
+			return nil, err
+		}
+		currentBody = stripPRStackSection(existingDetails.Body)
+	}
+	stackBody, err := s.buildPRBody(targetBranch, currentBody)
+	if err != nil {
+		return nil, err
+	}
+
 	s.stepf("updating PR #%d base to %s", existing.Number, base)
 	editArgs := []string{"pr", "edit", fmt.Sprintf("%d", existing.Number), "--base", base}
 	if title != "" {
 		editArgs = append(editArgs, "--title", title)
 	}
-	if body != "" {
-		editArgs = append(editArgs, "--body", body)
-	}
+	editArgs = append(editArgs, "--body", stackBody)
 	if _, err := s.repo.GH(editArgs...); err != nil {
 		return nil, err
 	}
@@ -1548,7 +1701,13 @@ type ghPR struct {
 	Number      int    `json:"number"`
 	URL         string `json:"url"`
 	BaseRefName string `json:"baseRefName"`
+	Body        string `json:"body,omitempty"`
 }
+
+const (
+	prStackStart = "<!-- git-weld:stack:start -->"
+	prStackEnd   = "<!-- git-weld:stack:end -->"
+)
 
 func (s *Service) findPR(branch string) (*ghPR, error) {
 	out, err := s.repo.GH("pr", "list", "--head", branch, "--json", "number,url,baseRefName")
@@ -1563,6 +1722,181 @@ func (s *Service) findPR(branch string) (*ghPR, error) {
 		return &ghPR{}, nil
 	}
 	return &prs[0], nil
+}
+
+func (s *Service) viewPR(number int) (*ghPR, error) {
+	out, err := s.repo.GH("pr", "view", fmt.Sprintf("%d", number), "--json", "body,number,url,baseRefName")
+	if err != nil {
+		return nil, err
+	}
+	var pr ghPR
+	if err := json.Unmarshal([]byte(out), &pr); err != nil {
+		return nil, err
+	}
+	return &pr, nil
+}
+
+func (s *Service) buildPRBody(branch string, body string) (string, error) {
+	graph, err := s.renderPRTreeMarkdown(branch)
+	if err != nil {
+		return "", err
+	}
+	section := strings.Join([]string{
+		prStackStart,
+		"<details>",
+		"<summary><strong>Branch Tree</strong></summary>",
+		"",
+		graph,
+		"",
+		"_generated by [git-weld](https://github.com/williamjaackson/git-weld)_",
+		"</details>",
+		prStackEnd,
+	}, "\n")
+	trimmed := strings.TrimSpace(stripPRStackSection(body))
+	if trimmed == "" {
+		return section, nil
+	}
+	return section + "\n\n" + trimmed, nil
+}
+
+func stripPRStackSection(body string) string {
+	start := strings.Index(body, prStackStart)
+	if start == -1 {
+		return body
+	}
+	end := strings.Index(body[start:], prStackEnd)
+	if end == -1 {
+		return body
+	}
+	end += start + len(prStackEnd)
+	left := strings.TrimRight(body[:start], "\n")
+	right := strings.TrimLeft(body[end:], "\n")
+	switch {
+	case left == "":
+		return right
+	case right == "":
+		return left
+	default:
+		return left + "\n\n" + right
+	}
+}
+
+func (s *Service) renderPRTreeMarkdown(branch string) (string, error) {
+	labels, err := s.prBranchLabels(branch)
+	if err != nil {
+		return "", err
+	}
+	lines := []string{"- " + labels[branch], "  - upstream"}
+	parentLines, err := s.renderPRParentMarkdown(branch, "    ", map[string]struct{}{branch: {}}, labels)
+	if err != nil {
+		return "", err
+	}
+	if len(parentLines) == 0 {
+		lines = append(lines, "    - "+labels[s.rootBranch()])
+	} else {
+		lines = append(lines, parentLines...)
+	}
+	lines = append(lines, "  - downstream")
+	childLines, err := s.renderPRChildMarkdown(branch, "    ", map[string]struct{}{branch: {}}, labels)
+	if err != nil {
+		return "", err
+	}
+	if len(childLines) == 0 {
+		lines = append(lines, "    - (none)")
+	} else {
+		lines = append(lines, childLines...)
+	}
+	return strings.Join(lines, "\n"), nil
+}
+
+func (s *Service) prBranchLabels(branch string) (map[string]string, error) {
+	labels := map[string]string{s.rootBranch(): s.rootBranch()}
+	nodes := []string{branch}
+	ancestors, err := s.ancestorClosure(branch)
+	if err != nil {
+		return nil, err
+	}
+	nodes = append(nodes, ancestors...)
+	descendants, err := s.descendants(branch)
+	if err != nil {
+		return nil, err
+	}
+	nodes = append(nodes, descendants...)
+	seen := map[string]struct{}{}
+	for _, node := range nodes {
+		if node == "" {
+			continue
+		}
+		if _, ok := seen[node]; ok {
+			continue
+		}
+		seen[node] = struct{}{}
+		labels[node] = node
+	}
+	if !s.repo.HasGH() {
+		return labels, nil
+	}
+	for node := range seen {
+		if node == s.rootBranch() {
+			continue
+		}
+		pr, err := s.findPR(node)
+		if err != nil || pr.Number == 0 || pr.URL == "" {
+			continue
+		}
+		labels[node] = fmt.Sprintf("[%s #%d](%s)", node, pr.Number, pr.URL)
+	}
+	return labels, nil
+}
+
+func (s *Service) renderPRParentMarkdown(branch string, prefix string, seen map[string]struct{}, labels map[string]string) ([]string, error) {
+	parents, err := s.meta.Parents(branch)
+	if err != nil {
+		return nil, err
+	}
+	if len(parents) == 0 {
+		return nil, nil
+	}
+	lines := make([]string, 0)
+	for _, parent := range parents {
+		if _, ok := seen[parent]; ok {
+			continue
+		}
+		lines = append(lines, prefix+"- "+labels[parent])
+		nextSeen := cloneSeen(seen)
+		nextSeen[parent] = struct{}{}
+		if parent == s.rootBranch() {
+			continue
+		}
+		descendants, err := s.renderPRParentMarkdown(parent, prefix+"  ", nextSeen, labels)
+		if err != nil {
+			return nil, err
+		}
+		lines = append(lines, descendants...)
+	}
+	return lines, nil
+}
+
+func (s *Service) renderPRChildMarkdown(branch string, prefix string, seen map[string]struct{}, labels map[string]string) ([]string, error) {
+	children, err := s.directChildren(branch)
+	if err != nil {
+		return nil, err
+	}
+	lines := make([]string, 0)
+	for _, child := range children {
+		if _, ok := seen[child]; ok {
+			continue
+		}
+		lines = append(lines, prefix+"- "+labels[child])
+		nextSeen := cloneSeen(seen)
+		nextSeen[child] = struct{}{}
+		subtree, err := s.renderPRChildMarkdown(child, prefix+"  ", nextSeen, labels)
+		if err != nil {
+			return nil, err
+		}
+		lines = append(lines, subtree...)
+	}
+	return lines, nil
 }
 
 func (s *Service) refreshPRBaseIfExists(branch string) (bool, error) {
@@ -1580,7 +1914,15 @@ func (s *Service) refreshPRBaseIfExists(branch string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if _, err := s.repo.GH("pr", "edit", fmt.Sprintf("%d", existing.Number), "--base", base); err != nil {
+	existingDetails, err := s.viewPR(existing.Number)
+	if err != nil {
+		return false, nil
+	}
+	body, err := s.buildPRBody(branch, stripPRStackSection(existingDetails.Body))
+	if err != nil {
+		return false, err
+	}
+	if _, err := s.repo.GH("pr", "edit", fmt.Sprintf("%d", existing.Number), "--base", base, "--body", body); err != nil {
 		return false, nil
 	}
 	return true, nil
@@ -1609,6 +1951,40 @@ func (s *Service) renderParentTree(branch string, prefix string, seen map[string
 		nextSeen := cloneSeen(seen)
 		nextSeen[parent] = struct{}{}
 		descendants, err := s.renderParentTree(parent, nextPrefix, nextSeen)
+		if err != nil {
+			return nil, err
+		}
+		lines = append(lines, descendants...)
+	}
+	return lines, nil
+}
+
+func (s *Service) renderParentTreeWithRoot(branch string, prefix string, seen map[string]struct{}) ([]string, error) {
+	parents, err := s.meta.Parents(branch)
+	if err != nil {
+		return nil, err
+	}
+	if len(parents) == 0 {
+		return []string{prefix + "└─ " + s.rootBranch()}, nil
+	}
+	lines := make([]string, 0)
+	for i, parent := range parents {
+		if _, ok := seen[parent]; ok {
+			continue
+		}
+		connector := "├─ "
+		nextPrefix := prefix + "│  "
+		if i == len(parents)-1 {
+			connector = "└─ "
+			nextPrefix = prefix + "   "
+		}
+		lines = append(lines, prefix+connector+parent)
+		nextSeen := cloneSeen(seen)
+		nextSeen[parent] = struct{}{}
+		if parent == s.rootBranch() {
+			continue
+		}
+		descendants, err := s.renderParentTreeWithRoot(parent, nextPrefix, nextSeen)
 		if err != nil {
 			return nil, err
 		}
