@@ -4,6 +4,33 @@
 
 It is designed for workflows where a branch can depend on multiple sibling branches at once, while still allowing you to view and rebase only the branch-specific work.
 
+## Getting Started
+
+Clone the repo:
+
+```bash
+git clone https://github.com/williamjaackson/git-weld
+cd git-weld
+```
+
+Install the binary into a directory on your `PATH`:
+
+```bash
+make install INSTALL_DIR="$HOME/.local/bin"
+```
+
+Initialize `git-weld` in your repository:
+
+```bash
+git weld init
+```
+
+Show the available commands:
+
+```bash
+git weld help
+```
+
 ## Current Scope
 
 This repository implements:
@@ -19,6 +46,7 @@ This repository implements:
 
 Current commands:
 
+- `git weld help`
 - `git weld new <branch>`
 - `git weld init [--main <branch>] [--remote <remote>] [--no-remote]`
 - `git weld stack <branch> [<base>] [-c|--create]`
@@ -34,6 +62,10 @@ Current commands:
 - `git weld pr [<branch>] [--title <title>] [--body <body>] [--draft] [--web]`
 
 ## Command Behavior
+
+### `git weld help`
+
+- prints the available `git weld` commands and flags
 
 ### `git weld new <branch>`
 
@@ -196,33 +228,6 @@ Current commands:
 ```bash
 make build
 ./bin/git-weld help
-```
-
-## Install
-
-Build directly into a directory on your `PATH`:
-
-```bash
-make install INSTALL_DIR="$HOME/.local/bin"
-```
-
-That produces:
-
-```bash
-$HOME/.local/bin/git-weld
-```
-
-If `~/.local/bin` is not on your `PATH`, add this to `~/.zshrc`:
-
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-Then verify:
-
-```bash
-git weld help
-git weld status
 ```
 
 ## Development
