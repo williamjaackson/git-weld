@@ -182,29 +182,17 @@ make build
 
 ## Install
 
-Build directly into a directory on your `PATH`:
+Clone the repo:
+
+```bash
+git clone https://github.com/williamjaackson/git-weld
+cd git-weld
+```
+
+Install the binary into a directory on your `PATH`:
 
 ```bash
 make install INSTALL_DIR="$HOME/.local/bin"
-```
-
-That produces:
-
-```bash
-$HOME/.local/bin/git-weld
-```
-
-If `~/.local/bin` is not on your `PATH`, add this to `~/.zshrc`:
-
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-Then verify:
-
-```bash
-git weld help
-git weld status
 ```
 
 ## Development
