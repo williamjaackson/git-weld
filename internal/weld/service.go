@@ -34,6 +34,13 @@ type ShipResult struct {
 	PRBasesUpdated   []string
 }
 
+type DropOptions struct {
+	Remote   bool
+	Promote  bool
+	Cascade  bool
+	Reparent string
+}
+
 type SyncMode int
 
 const (
@@ -387,6 +394,253 @@ func (s *Service) Unstack(branch string, base string) error {
 	if err := s.syncBranchToCurrentBase(targetBranch, oldBaseOIDs[targetBranch]); err != nil {
 		return err
 	}
+	return nil
+}
+
+func (s *Service) Drop(branch string, opts DropOptions) error {
+	oldBaseOIDs, err := s.snapshotEffectiveBaseOIDs()
+	if err != nil {
+		return err
+	}
+	if err := s.reconcileMetadata(); err != nil {
+		return err
+	}
+
+	targetBranch, err := s.repo.ResolveBranch(branch)
+	if err != nil {
+		return err
+	}
+	if targetBranch == s.rootBranch() {
+		return fmt.Errorf("cannot drop root branch %q", s.rootBranch())
+	}
+	if err := s.requireManagedBranch(targetBranch); err != nil {
+		return err
+	}
+	if opts.Remote {
+		if !s.remoteEnabled() {
+			return errors.New("remote features are disabled")
+		}
+		if !s.repo.HasGH() {
+			return errors.New("gh is required for `git weld drop --remote`")
+		}
+	}
+
+	children, err := s.directChildren(targetBranch)
+	if err != nil {
+		return err
+	}
+	if len(children) > 0 && !opts.Promote && !opts.Cascade && strings.TrimSpace(opts.Reparent) == "" {
+		return fmt.Errorf("branch %q has downstream branches: %s; use --promote, --cascade, or --reparent <branch>", targetBranch, strings.Join(children, ", "))
+	}
+
+	reparentTarget := ""
+	if strings.TrimSpace(opts.Reparent) != "" {
+		reparentTarget, err = s.repo.ResolveBranch(opts.Reparent)
+		if err != nil {
+			return err
+		}
+		if reparentTarget == targetBranch {
+			return errors.New("branch cannot be reparented to itself")
+		}
+		if err := s.requireManagedOrRoot(reparentTarget); err != nil {
+			return err
+		}
+	}
+
+	toDelete := map[string]struct{}{targetBranch: {}}
+	if opts.Cascade {
+		descendants, err := s.descendants(targetBranch)
+		if err != nil {
+			return err
+		}
+		for _, descendant := range descendants {
+			toDelete[descendant] = struct{}{}
+		}
+	}
+
+	impacted, err := s.descendants(targetBranch)
+	if err != nil {
+		return err
+	}
+	survivors := make([]string, 0, len(impacted))
+	for _, item := range impacted {
+		if _, ok := toDelete[item]; !ok {
+			survivors = append(survivors, item)
+		}
+	}
+
+	targetParents, err := s.meta.Parents(targetBranch)
+	if err != nil {
+		return err
+	}
+	if len(survivors) > 0 {
+		switch {
+		case opts.Promote:
+			for _, child := range survivors {
+				parents, err := s.meta.Parents(child)
+				if err != nil {
+					return err
+				}
+				rewritten := make([]string, 0, len(parents)+len(targetParents))
+				for _, parent := range parents {
+					if parent == targetBranch {
+						rewritten = append(rewritten, targetParents...)
+						continue
+					}
+					rewritten = append(rewritten, parent)
+				}
+				if err := s.meta.SetParents(child, rewritten); err != nil {
+					return err
+				}
+			}
+		case reparentTarget != "":
+			for _, child := range survivors {
+				if child == reparentTarget {
+					return fmt.Errorf("reparenting %q would create a cycle", child)
+				}
+				if ok, err := s.hasPath(reparentTarget, child); err != nil {
+					return err
+				} else if ok {
+					return fmt.Errorf("reparenting %q to %q would create a cycle", child, reparentTarget)
+				}
+				parents, err := s.meta.Parents(child)
+				if err != nil {
+					return err
+				}
+				rewritten := make([]string, 0, len(parents))
+				for _, parent := range parents {
+					if parent == targetBranch {
+						rewritten = append(rewritten, reparentTarget)
+						continue
+					}
+					rewritten = append(rewritten, parent)
+				}
+				if err := s.meta.SetParents(child, rewritten); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	currentBranch, err := s.repo.CurrentBranch()
+	if err == nil && currentBranch != "" {
+		if _, deletingCurrent := toDelete[currentBranch]; deletingCurrent {
+			s.stepf("switching to %s", s.rootBranch())
+			if err := s.repo.Checkout(s.rootBranch()); err != nil {
+				return err
+			}
+		}
+	}
+
+	deleteOrder := make([]string, 0, len(toDelete))
+	if opts.Cascade {
+		deleteOrder = append(deleteOrder, impacted...)
+	}
+	deleteOrder = append(deleteOrder, targetBranch)
+	for i := len(deleteOrder) - 1; i >= 0; i-- {
+		item := deleteOrder[i]
+		if _, ok := toDelete[item]; !ok {
+			continue
+		}
+		if !s.repo.BranchExists(item) {
+			continue
+		}
+		s.stepf("dropping branch %s", item)
+		if err := s.meta.Unmanage(item); err != nil {
+			return err
+		}
+		_ = s.repo.DeleteBranch(s.repo.SyntheticBranchName(item))
+		if err := s.repo.DeleteBranch(item); err != nil {
+			return err
+		}
+	}
+
+	if err := s.reconcileMetadata(); err != nil {
+		return err
+	}
+
+	if len(survivors) > 0 {
+		survivorOrder, err := s.topologicalSort(survivors...)
+		if err != nil {
+			return err
+		}
+		survivorSet := map[string]struct{}{}
+		for _, branch := range survivors {
+			survivorSet[branch] = struct{}{}
+		}
+		for _, item := range survivorOrder {
+			if _, ok := survivorSet[item]; !ok {
+				continue
+			}
+			if err := s.syncBranchToCurrentBase(item, oldBaseOIDs[item]); err != nil {
+				return err
+			}
+		}
+	}
+
+	if !opts.Remote {
+		return nil
+	}
+
+	shipRoots := survivors
+	if len(shipRoots) > 0 {
+		branches, synthetics, syntheticDeletes, err := s.unionShipPlan(shipRoots)
+		if err != nil {
+			return err
+		}
+		for _, ref := range synthetics {
+			s.stepf("pushing welded base")
+			if err := s.repo.PushBranch(s.remoteName(), ref); err != nil {
+				return err
+			}
+		}
+		for _, item := range branches {
+			s.stepf("pushing branch %s", item)
+			if err := s.repo.PushBranch(s.remoteName(), item); err != nil {
+				return err
+			}
+		}
+		for _, item := range branches {
+			updated, err := s.refreshPRBaseIfExists(item)
+			if err != nil {
+				return err
+			}
+			if updated {
+				s.stepf("updated PR base for %s", item)
+			}
+		}
+		for _, ref := range syntheticDeletes {
+			deleted, err := s.repo.DeleteRemoteBranch(s.remoteName(), ref)
+			if err != nil {
+				return err
+			}
+			if deleted {
+				s.stepf("removed remote welded base")
+			}
+		}
+	}
+
+	for i := len(deleteOrder) - 1; i >= 0; i-- {
+		item := deleteOrder[i]
+		if _, ok := toDelete[item]; !ok {
+			continue
+		}
+		closed, err := s.closePRIfExists(item)
+		if err != nil {
+			return err
+		}
+		if closed {
+			s.stepf("closed PR for %s", item)
+		}
+		deleted, err := s.repo.DeleteRemoteBranch(s.remoteName(), item)
+		if err != nil {
+			return err
+		}
+		if deleted {
+			s.stepf("deleted remote branch %s", item)
+		}
+	}
+
 	return nil
 }
 
@@ -1697,6 +1951,43 @@ func (s *Service) shipPlan(branch string, tree bool) ([]string, []string, []stri
 	return realBranches, syntheticBranches, syntheticDeletes, nil
 }
 
+func (s *Service) unionShipPlan(branches []string) ([]string, []string, []string, error) {
+	realBranches := make([]string, 0)
+	syntheticBranches := make([]string, 0)
+	syntheticDeletes := make([]string, 0)
+	seenReal := map[string]struct{}{}
+	seenSynthetic := map[string]struct{}{}
+	seenSyntheticDeletes := map[string]struct{}{}
+	for _, branch := range branches {
+		real, synthetics, deletes, err := s.shipPlan(branch, false)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		for _, item := range real {
+			if _, ok := seenReal[item]; ok {
+				continue
+			}
+			seenReal[item] = struct{}{}
+			realBranches = append(realBranches, item)
+		}
+		for _, item := range synthetics {
+			if _, ok := seenSynthetic[item]; ok {
+				continue
+			}
+			seenSynthetic[item] = struct{}{}
+			syntheticBranches = append(syntheticBranches, item)
+		}
+		for _, item := range deletes {
+			if _, ok := seenSyntheticDeletes[item]; ok {
+				continue
+			}
+			seenSyntheticDeletes[item] = struct{}{}
+			syntheticDeletes = append(syntheticDeletes, item)
+		}
+	}
+	return realBranches, syntheticBranches, syntheticDeletes, nil
+}
+
 type ghPR struct {
 	Number      int    `json:"number"`
 	URL         string `json:"url"`
@@ -1924,6 +2215,23 @@ func (s *Service) refreshPRBaseIfExists(branch string) (bool, error) {
 	}
 	if _, err := s.repo.GH("pr", "edit", fmt.Sprintf("%d", existing.Number), "--base", base, "--body", body); err != nil {
 		return false, nil
+	}
+	return true, nil
+}
+
+func (s *Service) closePRIfExists(branch string) (bool, error) {
+	if !s.repo.HasGH() {
+		return false, nil
+	}
+	existing, err := s.findPR(branch)
+	if err != nil {
+		return false, nil
+	}
+	if existing.Number == 0 {
+		return false, nil
+	}
+	if _, err := s.repo.GH("pr", "close", fmt.Sprintf("%d", existing.Number)); err != nil {
+		return false, err
 	}
 	return true, nil
 }

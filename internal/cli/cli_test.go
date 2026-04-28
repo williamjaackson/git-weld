@@ -106,3 +106,13 @@ func TestParsePrependArgs(t *testing.T) {
 		t.Fatalf("unexpected parsed prepend args: flags=%v values=%v", flags, values)
 	}
 }
+
+func TestParseDropArgs(t *testing.T) {
+	branch, remote, policy, reparent, err := parseDropArgs([]string{"fix-1", "--reparent", "fix-2", "--remote"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if branch != "fix-1" || !remote || policy != "reparent" || reparent != "fix-2" {
+		t.Fatalf("unexpected drop args: branch=%q remote=%v policy=%q reparent=%q", branch, remote, policy, reparent)
+	}
+}
