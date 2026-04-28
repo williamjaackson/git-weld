@@ -36,6 +36,12 @@ func (r *Repo) Run(args ...string) error {
 	return cmd.Run()
 }
 
+func (r *Repo) RunQuiet(args ...string) error {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = r.root
+	return cmd.Run()
+}
+
 func (r *Repo) Output(args ...string) (string, error) {
 	return output(r.root, "git", args...)
 }
@@ -86,10 +92,24 @@ func (r *Repo) HasRemote(remote string) bool {
 	return cmd.Run() == nil
 }
 
+func (r *Repo) RequireRemote(remote string) error {
+	if strings.TrimSpace(remote) == "" {
+		return errors.New("remote is not configured")
+	}
+	if !r.HasRemote(remote) {
+		return fmt.Errorf("remote %q does not exist", remote)
+	}
+	return nil
+}
+
 func (r *Repo) HasRef(ref string) bool {
 	cmd := exec.Command("git", "show-ref", "--verify", "--quiet", ref)
 	cmd.Dir = r.root
 	return cmd.Run() == nil
+}
+
+func (r *Repo) RemoteBranchRef(remote string, branch string) string {
+	return "refs/remotes/" + remote + "/" + branch
 }
 
 func (r *Repo) ListLocalBranches() ([]string, error) {
@@ -114,6 +134,33 @@ func (r *Repo) WorkingTreeClean() (bool, error) {
 	return strings.TrimSpace(out) == "", nil
 }
 
+func (r *Repo) StashPushIfNeeded(message string) (bool, error) {
+	clean, err := r.WorkingTreeClean()
+	if err != nil {
+		return false, err
+	}
+	if clean {
+		return false, nil
+	}
+	if message == "" {
+		message = "git-weld"
+	}
+	if err := r.RunQuiet("stash", "push", "--include-untracked", "--message", message); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (r *Repo) StashPop() error {
+	if _, err := r.Output("rev-parse", "--verify", "refs/stash"); err != nil {
+		return nil
+	}
+	if err := r.Run("stash", "pop", "--index", "--quiet"); err != nil {
+		return fmt.Errorf("restore local changes: %w", err)
+	}
+	return nil
+}
+
 func (r *Repo) Checkout(branch string) error {
 	return r.Run("switch", "--quiet", branch)
 }
@@ -122,31 +169,120 @@ func (r *Repo) CreateBranch(branch string, base string, checkout bool) error {
 	if checkout {
 		return r.Run("switch", "--quiet", "-c", branch, r.BranchRef(base))
 	}
-	return r.Run("branch", branch, r.BranchRef(base))
+	return r.RunQuiet("branch", branch, r.BranchRef(base))
 }
 
 func (r *Repo) DeleteBranch(branch string) error {
 	if !r.BranchExists(branch) {
 		return nil
 	}
-	return r.Run("branch", "-D", branch)
+	return r.RunQuiet("branch", "-D", branch)
 }
 
-func (r *Repo) UpdateLocalRoot(root string) error {
-	if !r.HasRemote("origin") {
+func (r *Repo) BranchOID(branch string) (string, error) {
+	return r.Output("rev-parse", r.BranchRef(branch))
+}
+
+func (r *Repo) RefOID(ref string) (string, error) {
+	return r.Output("rev-parse", ref)
+}
+
+func (r *Repo) UpdateRef(ref string, newOID string, oldOID string) error {
+	args := []string{"update-ref", ref, newOID}
+	if strings.TrimSpace(oldOID) != "" {
+		args = append(args, oldOID)
+	}
+	return r.RunQuiet(args...)
+}
+
+func (r *Repo) DeleteRef(ref string, oldOID string) error {
+	if !r.HasRef(ref) {
 		return nil
 	}
-	if err := r.Run("fetch", "origin"); err != nil {
+	args := []string{"update-ref", "-d", ref}
+	if strings.TrimSpace(oldOID) != "" {
+		args = append(args, oldOID)
+	}
+	return r.RunQuiet(args...)
+}
+
+func (r *Repo) RebaseAbort() error {
+	if _, err := r.Output("rev-parse", "--verify", "REBASE_HEAD"); err != nil {
+		return nil
+	}
+	return r.RunQuiet("rebase", "--abort")
+}
+
+func (r *Repo) PushBranch(remote string, branch string) error {
+	if err := r.RequireRemote(remote); err != nil {
 		return err
 	}
+	remoteRef := r.RemoteBranchRef(remote, branch)
+	shouldTrack := !strings.HasPrefix(branch, "_weld/")
+	if !r.HasRef(remoteRef) {
+		if err := r.Run("push", remote, r.BranchRef(branch)+":"+branch); err != nil {
+			return err
+		}
+		if shouldTrack {
+			return r.EnsureTrackingBranch(remote, branch)
+		}
+		return nil
+	}
+	ff, err := r.isRefAncestor(remoteRef, r.BranchRef(branch))
+	if err != nil {
+		return err
+	}
+	if ff {
+		if err := r.Run("push", remote, r.BranchRef(branch)+":"+branch); err != nil {
+			return err
+		}
+		if shouldTrack {
+			return r.EnsureTrackingBranch(remote, branch)
+		}
+		return nil
+	}
+	if err := r.Run("push", "--force-with-lease="+branch, remote, r.BranchRef(branch)+":"+branch); err != nil {
+		return err
+	}
+	if shouldTrack {
+		return r.EnsureTrackingBranch(remote, branch)
+	}
+	return nil
+}
 
-	remoteRef := "refs/remotes/origin/" + root
+func (r *Repo) RemoteBranchExists(remote string, branch string) (bool, error) {
+	out, err := r.Output("ls-remote", "--heads", remote, branch)
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) != "", nil
+}
+
+func (r *Repo) DeleteRemoteBranch(remote string, branch string) (bool, error) {
+	if err := r.RequireRemote(remote); err != nil {
+		return false, err
+	}
+	exists, err := r.RemoteBranchExists(remote, branch)
+	if err != nil {
+		return false, err
+	}
+	if !exists {
+		return false, nil
+	}
+	return true, r.Run("push", remote, "--delete", branch)
+}
+
+func (r *Repo) UpdateLocalRoot(remote string, root string) error {
+	if strings.TrimSpace(remote) == "" || !r.HasRemote(remote) {
+		return nil
+	}
+	remoteRef := "refs/remotes/" + remote + "/" + root
 	localRef := "refs/heads/" + root
 	if !r.HasRef(remoteRef) || !r.HasRef(localRef) {
 		return nil
 	}
 
-	counts, err := r.Output("rev-list", "--left-right", "--count", r.BranchRef(root)+"...refs/remotes/origin/"+root)
+	counts, err := r.Output("rev-list", "--left-right", "--count", r.BranchRef(root)+"...refs/remotes/"+remote+"/"+root)
 	if err != nil {
 		return err
 	}
@@ -155,13 +291,13 @@ func (r *Repo) UpdateLocalRoot(root string) error {
 		return fmt.Errorf("unexpected rev-list output %q", counts)
 	}
 	if fields[0] != "0" {
-		return fmt.Errorf("%s has diverged from origin/%s", root, root)
+		return fmt.Errorf("%s has diverged from %s/%s", root, remote, root)
 	}
 	if fields[1] == "0" {
 		return nil
 	}
 
-	newOID, err := r.Output("rev-parse", "refs/remotes/origin/"+root)
+	newOID, err := r.Output("rev-parse", "refs/remotes/"+remote+"/"+root)
 	if err != nil {
 		return err
 	}
@@ -170,6 +306,126 @@ func (r *Repo) UpdateLocalRoot(root string) error {
 		return err
 	}
 	return r.Run("update-ref", localRef, newOID, oldOID)
+}
+
+func (r *Repo) Fetch(remote string) error {
+	if err := r.RequireRemote(remote); err != nil {
+		return err
+	}
+	return r.Run("fetch", remote)
+}
+
+func (r *Repo) TrackingRef(branch string) (string, error) {
+	remote, err := r.Output("config", "--local", "--get", "branch."+branch+".remote")
+	if err != nil || strings.TrimSpace(remote) == "" {
+		return "", nil
+	}
+	mergeRef, err := r.Output("config", "--local", "--get", "branch."+branch+".merge")
+	if err != nil || strings.TrimSpace(mergeRef) == "" {
+		return "", nil
+	}
+	mergeRef = strings.TrimSpace(mergeRef)
+	const headsPrefix = "refs/heads/"
+	if strings.HasPrefix(mergeRef, headsPrefix) {
+		mergeRef = strings.TrimPrefix(mergeRef, headsPrefix)
+	}
+	return "refs/remotes/" + strings.TrimSpace(remote) + "/" + mergeRef, nil
+}
+
+func (r *Repo) EnsureTrackingBranch(remote string, branch string) error {
+	trackingRef, err := r.TrackingRef(branch)
+	if err != nil {
+		return err
+	}
+	expected := "refs/remotes/" + strings.TrimSpace(remote) + "/" + branch
+	if trackingRef == expected {
+		return nil
+	}
+	return r.RunQuiet("branch", "--quiet", "--set-upstream-to="+remote+"/"+branch, branch)
+}
+
+func (r *Repo) EnsureTrackingBranchIfRemoteExists(remote string, branch string) error {
+	if err := r.RequireRemote(remote); err != nil {
+		return err
+	}
+	trackingRef, err := r.TrackingRef(branch)
+	if err != nil {
+		return err
+	}
+	if trackingRef != "" {
+		return nil
+	}
+	exists, err := r.RemoteBranchExists(remote, branch)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	return r.EnsureTrackingBranch(remote, branch)
+}
+
+func (r *Repo) UpdateLocalBranchFromTracking(branch string) error {
+	trackingRef, err := r.TrackingRef(branch)
+	if err != nil {
+		return err
+	}
+	if trackingRef == "" || !r.HasRef(trackingRef) || !r.HasRef(r.BranchRef(branch)) {
+		return nil
+	}
+
+	counts, err := r.Output("rev-list", "--left-right", "--count", r.BranchRef(branch)+"..."+trackingRef)
+	if err != nil {
+		return err
+	}
+	fields := strings.Fields(counts)
+	if len(fields) != 2 {
+		return fmt.Errorf("unexpected rev-list output %q", counts)
+	}
+	if fields[0] == "0" && fields[1] == "0" {
+		return nil
+	}
+	if fields[0] != "0" && fields[1] == "0" {
+		return nil
+	}
+	if fields[0] == "0" {
+		newOID, err := r.Output("rev-parse", trackingRef)
+		if err != nil {
+			return err
+		}
+		oldOID, err := r.Output("rev-parse", r.BranchRef(branch))
+		if err != nil {
+			return err
+		}
+		return r.Run("update-ref", r.BranchRef(branch), newOID, oldOID)
+	}
+	return r.RebaseBranchOntoRef(branch, trackingRef)
+}
+
+func (r *Repo) RebaseBranchOntoRef(branch string, targetRef string) error {
+	cur, err := r.CurrentBranch()
+	if err != nil {
+		return err
+	}
+	restore := cur
+	success := false
+
+	if cur != branch {
+		if err := r.Checkout(branch); err != nil {
+			return err
+		}
+	}
+	defer func() {
+		if success && restore != branch {
+			_ = r.Checkout(restore)
+		}
+	}()
+
+	if err := r.Run("rebase", "--quiet", targetRef); err != nil {
+		return fmt.Errorf("rebase %s onto tracking branch: %w", branch, err)
+	}
+	success = true
+	return nil
 }
 
 func (r *Repo) RebaseBranchOnto(branch string, base string) error {
@@ -186,6 +442,7 @@ func (r *Repo) RebaseBranchOntoFrom(branch string, oldBaseOID string, newBase st
 		return err
 	}
 	restore := cur
+	success := false
 
 	if cur != branch {
 		if err := r.Checkout(branch); err != nil {
@@ -193,12 +450,29 @@ func (r *Repo) RebaseBranchOntoFrom(branch string, oldBaseOID string, newBase st
 		}
 	}
 	defer func() {
-		if restore != branch {
+		if success && restore != branch {
 			_ = r.Checkout(restore)
 		}
 	}()
 
-	return r.Run("rebase", "--quiet", "--onto", r.BranchRef(newBase), oldBaseOID)
+	if err := r.Run("rebase", "--quiet", "--onto", r.BranchRef(newBase), oldBaseOID); err != nil {
+		return err
+	}
+	success = true
+	return nil
+}
+
+func (r *Repo) isRefAncestor(ancestorRef string, descendantRef string) (bool, error) {
+	cmd := exec.Command("git", "merge-base", "--is-ancestor", ancestorRef, descendantRef)
+	cmd.Dir = r.root
+	if err := cmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func (r *Repo) Diff(base string, branch string) (string, error) {
@@ -333,4 +607,13 @@ func (r *Repo) ConfigKeys(expr string) ([]string, error) {
 
 func (r *Repo) EnsureDir(path string) error {
 	return os.MkdirAll(filepath.Dir(path), 0o755)
+}
+
+func (r *Repo) GH(args ...string) (string, error) {
+	return output(r.root, "gh", args...)
+}
+
+func (r *Repo) HasGH() bool {
+	_, err := exec.LookPath("gh")
+	return err == nil
 }

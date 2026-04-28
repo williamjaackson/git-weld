@@ -13,8 +13,22 @@ type Metadata struct {
 	repo *git.Repo
 }
 
+type Settings struct {
+	RootBranch string
+	RemoteName string
+	RemoteOff  bool
+}
+
 func NewMetadata(repo *git.Repo) *Metadata {
 	return &Metadata{repo: repo}
+}
+
+func DefaultSettings() Settings {
+	return Settings{
+		RootBranch: "master",
+		RemoteName: "origin",
+		RemoteOff:  false,
+	}
 }
 
 func (m *Metadata) Parents(branch string) ([]string, error) {
@@ -110,12 +124,78 @@ func (m *Metadata) ManagedBranches() ([]string, error) {
 	return branches, nil
 }
 
+func (m *Metadata) Settings() (Settings, error) {
+	settings := DefaultSettings()
+
+	if values, err := m.repo.ConfigGetAll(rootKey()); err != nil {
+		return Settings{}, err
+	} else if len(values) > 0 && strings.TrimSpace(values[0]) != "" {
+		settings.RootBranch = strings.TrimSpace(values[0])
+	}
+
+	if values, err := m.repo.ConfigGetAll(remoteKey()); err != nil {
+		return Settings{}, err
+	} else if len(values) > 0 {
+		settings.RemoteName = strings.TrimSpace(values[0])
+	}
+
+	if values, err := m.repo.ConfigGetAll(remoteDisabledKey()); err != nil {
+		return Settings{}, err
+	} else if len(values) > 0 {
+		switch strings.TrimSpace(values[0]) {
+		case "true", "1", "yes", "on":
+			settings.RemoteOff = true
+		default:
+			settings.RemoteOff = false
+		}
+	}
+
+	return settings, nil
+}
+
+func (m *Metadata) SaveSettings(settings Settings) error {
+	root := strings.TrimSpace(settings.RootBranch)
+	if root == "" {
+		root = DefaultSettings().RootBranch
+	}
+	remote := strings.TrimSpace(settings.RemoteName)
+
+	if err := m.repo.Run("config", "--local", rootKey(), root); err != nil {
+		return err
+	}
+	if settings.RemoteOff {
+		if err := m.repo.Run("config", "--local", remoteDisabledKey(), "true"); err != nil {
+			return err
+		}
+		return m.repo.ConfigUnsetAll(remoteKey())
+	}
+	if err := m.repo.Run("config", "--local", remoteDisabledKey(), "false"); err != nil {
+		return err
+	}
+	if remote == "" {
+		remote = DefaultSettings().RemoteName
+	}
+	return m.repo.Run("config", "--local", remoteKey(), remote)
+}
+
 func parentKey(branch string) string {
 	return "weld.parents." + encode(branch)
 }
 
 func managedKey(branch string) string {
 	return "weld.managed." + encode(branch)
+}
+
+func rootKey() string {
+	return "weld.root"
+}
+
+func remoteKey() string {
+	return "weld.remote"
+}
+
+func remoteDisabledKey() string {
+	return "weld.remoteDisabled"
 }
 
 func encode(value string) string {

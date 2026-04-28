@@ -1,19 +1,22 @@
 package weld
 
 import (
+	"bufio"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 
 	"github.com/williamjaackson/git-weld/internal/git"
 )
 
-const rootBranch = "master"
-
 type Service struct {
-	repo *git.Repo
-	meta *Metadata
+	repo     *git.Repo
+	meta     *Metadata
+	settings Settings
+	reporter func(string)
 }
 
 type StatusEntry struct {
@@ -21,15 +24,180 @@ type StatusEntry struct {
 	Parents []string
 }
 
+type ShipResult struct {
+	BranchesPushed   []string
+	SyntheticPushed  []string
+	SyntheticDeleted []string
+	PRBasesUpdated   []string
+}
+
+type SyncMode int
+
+const (
+	SyncModeDefault SyncMode = iota
+	SyncModeLocal
+	SyncModeRemote
+)
+
+type PRResult struct {
+	Number int
+	URL    string
+	Base   string
+	Head   string
+}
+
+type refSnapshot struct {
+	Ref    string
+	Exists bool
+	OID    string
+}
+
 func Open(startDir string) (*Service, error) {
 	repo, err := git.Open(startDir)
 	if err != nil {
 		return nil, err
 	}
+	meta := NewMetadata(repo)
+	settings, err := meta.Settings()
+	if err != nil {
+		return nil, err
+	}
 	return &Service{
-		repo: repo,
-		meta: NewMetadata(repo),
+		repo:     repo,
+		meta:     meta,
+		settings: settings,
 	}, nil
+}
+
+func (s *Service) rootBranch() string {
+	return s.settings.RootBranch
+}
+
+func (s *Service) remoteEnabled() bool {
+	return !s.settings.RemoteOff
+}
+
+func (s *Service) remoteName() string {
+	return s.settings.RemoteName
+}
+
+func (s *Service) Settings() Settings {
+	return s.settings
+}
+
+func (s *Service) CurrentBranch() (string, error) {
+	return s.repo.CurrentBranch()
+}
+
+func (s *Service) SetReporter(reporter func(string)) {
+	s.reporter = reporter
+}
+
+func (s *Service) stepf(format string, args ...any) {
+	if s.reporter != nil {
+		s.reporter(fmt.Sprintf(format, args...))
+	}
+}
+
+func (s *Service) Init(rootBranch string, remoteName string, remoteDisabled bool) error {
+	rootBranch = strings.TrimSpace(rootBranch)
+	if rootBranch == "" {
+		return errors.New("main branch is required")
+	}
+	if !s.repo.BranchExists(rootBranch) {
+		return fmt.Errorf("branch %q does not exist", rootBranch)
+	}
+
+	remoteName = strings.TrimSpace(remoteName)
+	if !remoteDisabled {
+		if remoteName == "" {
+			remoteName = DefaultSettings().RemoteName
+		}
+		if err := s.repo.RequireRemote(remoteName); err != nil {
+			return err
+		}
+	}
+
+	settings := Settings{
+		RootBranch: rootBranch,
+		RemoteName: remoteName,
+		RemoteOff:  remoteDisabled,
+	}
+	if err := s.meta.SaveSettings(settings); err != nil {
+		return err
+	}
+	s.settings = settings
+	s.stepf("configured main branch: %s", rootBranch)
+	if remoteDisabled {
+		s.stepf("disabled remote features")
+	} else {
+		s.stepf("configured remote: %s", remoteName)
+	}
+	return nil
+}
+
+func (s *Service) InitInteractive(in io.Reader, out io.Writer) error {
+	reader := bufio.NewReader(in)
+	current := s.rootBranch()
+	if current == "" {
+		current = DefaultSettings().RootBranch
+	}
+
+	if _, err := fmt.Fprintf(out, "main branch [%s]: ", current); err != nil {
+		return err
+	}
+	rootInput, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	root := strings.TrimSpace(rootInput)
+	if root == "" {
+		root = current
+	}
+
+	defaultRemote := s.remoteName()
+	if s.remoteEnabled() {
+		if defaultRemote == "" {
+			defaultRemote = DefaultSettings().RemoteName
+		}
+		if _, err := fmt.Fprintf(out, "remote name (or 'none') [%s]: ", defaultRemote); err != nil {
+			return err
+		}
+	} else {
+		if _, err := fmt.Fprint(out, "remote name (or 'none') [none]: "); err != nil {
+			return err
+		}
+	}
+	remoteInput, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	remote := strings.TrimSpace(remoteInput)
+	remoteDisabled := false
+	switch strings.ToLower(remote) {
+	case "", "origin":
+		if !s.remoteEnabled() && remote == "" {
+			remoteDisabled = true
+		}
+	case "none", "no", "off", "disabled":
+		remoteDisabled = true
+		remote = ""
+	default:
+		remoteDisabled = false
+	}
+	if remote == "" && !remoteDisabled {
+		if s.remoteEnabled() && s.remoteName() != "" {
+			remote = s.remoteName()
+		} else {
+			remote = DefaultSettings().RemoteName
+		}
+	}
+	if !s.remoteEnabled() && strings.TrimSpace(remoteInput) == "" {
+		remoteDisabled = true
+		remote = ""
+	}
+
+	return s.Init(root, remote, remoteDisabled)
 }
 
 func (s *Service) NewBranch(branch string) error {
@@ -39,12 +207,14 @@ func (s *Service) NewBranch(branch string) error {
 	if s.repo.BranchExists(branch) {
 		return fmt.Errorf("branch %q already exists", branch)
 	}
-	if !s.repo.BranchExists(rootBranch) {
-		return fmt.Errorf("root branch %q does not exist", rootBranch)
+	if !s.repo.BranchExists(s.rootBranch()) {
+		return fmt.Errorf("root branch %q does not exist", s.rootBranch())
 	}
-	if err := s.repo.CreateBranch(branch, rootBranch, true); err != nil {
+	s.stepf("creating branch %s from %s", branch, s.rootBranch())
+	if err := s.createBranchPreservingChanges(branch, s.rootBranch()); err != nil {
 		return err
 	}
+	s.stepf("tracking %s with implicit parent %s", branch, s.rootBranch())
 	return s.meta.MarkManaged(branch)
 }
 
@@ -83,20 +253,23 @@ func (s *Service) Stack(branch string, base string, create bool) error {
 		if s.repo.BranchExists(targetBranch) {
 			return fmt.Errorf("branch %q already exists", targetBranch)
 		}
-		if err := s.repo.CreateBranch(targetBranch, base, true); err != nil {
+		s.stepf("creating branch %s from %s", targetBranch, base)
+		if err := s.createBranchPreservingChanges(targetBranch, base); err != nil {
 			return err
 		}
-		if base == rootBranch {
+		if base == s.rootBranch() {
+			s.stepf("tracking %s with implicit parent %s", targetBranch, s.rootBranch())
 			return s.meta.MarkManaged(targetBranch)
 		}
+		s.stepf("adding parent %s to %s", base, targetBranch)
 		return s.meta.SetParents(targetBranch, []string{base})
 	}
 
 	if err := s.requireManagedBranch(targetBranch); err != nil {
 		return err
 	}
-	if base == rootBranch {
-		return errors.New("master is implicit; use `git weld unstack` to reset a branch back to master")
+	if base == s.rootBranch() {
+		return fmt.Errorf("%s is implicit; use `git weld unstack` to reset a branch back to %s", s.rootBranch(), s.rootBranch())
 	}
 	if ok, err := s.hasPath(base, targetBranch); err != nil {
 		return err
@@ -109,15 +282,53 @@ func (s *Service) Stack(branch string, base string, create bool) error {
 		return err
 	}
 	if len(parents) == 0 {
+		s.stepf("replacing implicit parent %s with %s on %s", s.rootBranch(), base, targetBranch)
 		if err := s.meta.SetParents(targetBranch, []string{base}); err != nil {
 			return err
 		}
 		return s.syncBranchToCurrentBase(targetBranch, oldBaseOIDs[targetBranch])
 	}
+	s.stepf("adding parent %s to %s", base, targetBranch)
 	if err := s.meta.AddParent(targetBranch, base); err != nil {
 		return err
 	}
 	return s.syncBranchToCurrentBase(targetBranch, oldBaseOIDs[targetBranch])
+}
+
+func (s *Service) createBranchPreservingChanges(branch string, base string) (err error) {
+	originalBranch, err := s.repo.CurrentBranch()
+	if err != nil {
+		return err
+	}
+	stashed, err := s.repo.StashPushIfNeeded("git-weld branch create")
+	if err != nil {
+		return err
+	}
+	if stashed {
+		s.stepf("stashed local changes")
+	}
+	defer func() {
+		if !stashed {
+			return
+		}
+		if err != nil {
+			current, currentErr := s.repo.CurrentBranch()
+			if currentErr == nil && current != originalBranch {
+				_ = s.repo.Checkout(originalBranch)
+			}
+		}
+		if restoreErr := s.repo.StashPop(); restoreErr != nil && err == nil {
+			err = restoreErr
+		}
+		if stashed && err == nil {
+			s.stepf("restored local changes")
+		}
+	}()
+	if err := s.repo.CreateBranch(branch, base, true); err != nil {
+		return err
+	}
+	s.stepf("switched to %s", branch)
+	return nil
 }
 
 func (s *Service) Unstack(branch string, base string) error {
@@ -162,15 +373,13 @@ func (s *Service) Unstack(branch string, base string) error {
 	if !found {
 		return fmt.Errorf("branch %q does not depend on %q", targetBranch, base)
 	}
+	s.stepf("removing parent %s from %s", base, targetBranch)
 
 	if err := s.meta.SetParents(targetBranch, filtered); err != nil {
 		return err
 	}
 	if err := s.syncBranchToCurrentBase(targetBranch, oldBaseOIDs[targetBranch]); err != nil {
 		return err
-	}
-	if len(filtered) <= 1 {
-		return s.repo.DeleteBranch(s.repo.SyntheticBranchName(targetBranch))
 	}
 	return nil
 }
@@ -187,13 +396,13 @@ func (s *Service) Show(branch string, includeChildren bool) (string, error) {
 	if err := s.requireManagedOrRoot(targetBranch); err != nil {
 		return "", err
 	}
-	if targetBranch == rootBranch {
-		return rootBranch, nil
+	if targetBranch == s.rootBranch() {
+		return s.rootBranch(), nil
 	}
 
 	lines := []string{targetBranch}
 	if includeChildren {
-		lines = []string{"(parents)", targetBranch}
+		lines = []string{"(upstream)", targetBranch}
 	}
 	parentLines, err := s.renderParentTree(targetBranch, "", map[string]struct{}{targetBranch: {}})
 	if err != nil {
@@ -202,14 +411,12 @@ func (s *Service) Show(branch string, includeChildren bool) (string, error) {
 	lines = append(lines, parentLines...)
 
 	if includeChildren {
-		lines = append(lines, "", "(children)", targetBranch)
+		lines = append(lines, "", "(downstream)", targetBranch)
 		childLines, err := s.renderChildTree(targetBranch, "", map[string]struct{}{targetBranch: {}})
 		if err != nil {
 			return "", err
 		}
-		if len(childLines) == 0 {
-			lines = append(lines, "")
-		} else {
+		if len(childLines) > 0 {
 			lines = append(lines, childLines...)
 		}
 	}
@@ -259,7 +466,7 @@ func (s *Service) Diff(branch string) (string, error) {
 	return s.repo.Diff(base, targetBranch)
 }
 
-func (s *Service) Sync(branch string, tree bool) error {
+func (s *Service) Sync(branch string, tree bool, mode SyncMode) error {
 	oldBaseOIDs, err := s.snapshotEffectiveBaseOIDs()
 	if err != nil {
 		return err
@@ -283,30 +490,45 @@ func (s *Service) Sync(branch string, tree bool) error {
 	if err := s.requireManagedBranch(targetBranch); err != nil {
 		return err
 	}
-	if err := s.repo.UpdateLocalRoot(rootBranch); err != nil {
-		return err
-	}
 
 	order, err := s.syncOrder(targetBranch, tree)
 	if err != nil {
 		return err
 	}
+	s.stepf("syncing %s (%s)", targetBranch, syncScopeLabel(tree))
 	originalBranch, err := s.repo.CurrentBranch()
 	if err != nil {
 		return err
 	}
+	snapshots, err := s.snapshotRefsForSync(order)
+	if err != nil {
+		return err
+	}
+	rollbackNeeded := true
 	defer func() {
-		if originalBranch == "" {
+		if !rollbackNeeded {
+			if originalBranch == "" {
+				return
+			}
+			current, currentErr := s.repo.CurrentBranch()
+			if currentErr == nil && current != originalBranch {
+				_ = s.repo.Checkout(originalBranch)
+			}
 			return
 		}
-		current, currentErr := s.repo.CurrentBranch()
-		if currentErr == nil && current != originalBranch {
+		_ = s.repo.RebaseAbort()
+		_ = s.restoreSnapshots(snapshots)
+		if originalBranch != "" {
 			_ = s.repo.Checkout(originalBranch)
 		}
 	}()
 
+	if err := s.refreshBranchesForSync(order, mode); err != nil {
+		return err
+	}
+
 	for _, item := range order {
-		if item == rootBranch {
+		if item == s.rootBranch() {
 			continue
 		}
 		base, err := s.ensureEffectiveBase(item)
@@ -319,13 +541,168 @@ func (s *Service) Sync(branch string, tree bool) error {
 		}
 		oldBaseOID := oldBaseOIDs[item]
 		if oldBaseOID == "" || oldBaseOID == newBaseOID {
+			s.stepf("skipping %s; already up to date", item)
 			continue
 		}
+		s.stepf("rebasing %s onto %s", item, base)
 		if err := s.repo.RebaseBranchOntoFrom(item, oldBaseOID, base); err != nil {
 			return fmt.Errorf("sync %s: %w", item, err)
 		}
 	}
+	rollbackNeeded = false
+	s.stepf("sync complete")
 	return nil
+}
+
+func (s *Service) Ship(branch string, tree bool, mode SyncMode) (*ShipResult, error) {
+	if err := s.reconcileMetadata(); err != nil {
+		return nil, err
+	}
+	if !s.remoteEnabled() {
+		return nil, errors.New("remote features are disabled; run `git weld init` to configure a remote")
+	}
+	if err := s.repo.RequireRemote(s.remoteName()); err != nil {
+		return nil, err
+	}
+
+	targetBranch, err := s.repo.ResolveBranch(branch)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.requireManagedBranch(targetBranch); err != nil {
+		return nil, err
+	}
+
+	if err := s.Sync(targetBranch, tree, mode); err != nil {
+		return nil, err
+	}
+	s.stepf("shipping %s (%s)", targetBranch, syncScopeLabel(tree))
+
+	toPush, syntheticRefs, syntheticDeletes, err := s.shipPlan(targetBranch, tree)
+	if err != nil {
+		return nil, err
+	}
+
+	result := &ShipResult{
+		BranchesPushed:   make([]string, 0, len(toPush)),
+		SyntheticPushed:  make([]string, 0, len(syntheticRefs)),
+		SyntheticDeleted: make([]string, 0, len(syntheticDeletes)),
+		PRBasesUpdated:   make([]string, 0, len(toPush)),
+	}
+	for _, ref := range syntheticRefs {
+		s.stepf("pushing welded base")
+		if err := s.repo.PushBranch(s.remoteName(), ref); err != nil {
+			return nil, err
+		}
+		result.SyntheticPushed = append(result.SyntheticPushed, ref)
+	}
+	for _, item := range toPush {
+		s.stepf("pushing branch %s", item)
+		if err := s.repo.PushBranch(s.remoteName(), item); err != nil {
+			return nil, err
+		}
+		result.BranchesPushed = append(result.BranchesPushed, item)
+		updated, err := s.refreshPRBaseIfExists(item)
+		if err != nil {
+			return nil, err
+		}
+		if updated {
+			s.stepf("updated PR base for %s", item)
+			result.PRBasesUpdated = append(result.PRBasesUpdated, item)
+		}
+	}
+	for _, ref := range syntheticDeletes {
+		deleted, err := s.repo.DeleteRemoteBranch(s.remoteName(), ref)
+		if err != nil {
+			return nil, err
+		}
+		if deleted {
+			s.stepf("removed remote welded base")
+			result.SyntheticDeleted = append(result.SyntheticDeleted, ref)
+		}
+	}
+	s.stepf("ship complete")
+	return result, nil
+}
+
+func (s *Service) PR(branch string, title string, body string, draft bool, web bool) (*PRResult, error) {
+	if err := s.reconcileMetadata(); err != nil {
+		return nil, err
+	}
+	if !s.remoteEnabled() {
+		return nil, errors.New("remote features are disabled; run `git weld init` to configure a remote")
+	}
+	targetBranch, err := s.repo.ResolveBranch(branch)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.requireManagedBranch(targetBranch); err != nil {
+		return nil, err
+	}
+
+	if _, err := s.Ship(targetBranch, false, SyncModeDefault); err != nil {
+		return nil, err
+	}
+
+	base, err := s.prBase(targetBranch)
+	if err != nil {
+		return nil, err
+	}
+
+	existing, err := s.findPR(targetBranch)
+	if err != nil {
+		return nil, err
+	}
+
+	if existing.Number == 0 {
+		s.stepf("creating PR for %s with base %s", targetBranch, base)
+		createArgs := []string{"pr", "create", "--base", base, "--head", targetBranch}
+		if title == "" && body == "" {
+			createArgs = append(createArgs, "--fill")
+		} else {
+			if title != "" {
+				createArgs = append(createArgs, "--title", title)
+			}
+			if body != "" {
+				createArgs = append(createArgs, "--body", body)
+			}
+		}
+		if draft {
+			createArgs = append(createArgs, "--draft")
+		}
+		if _, err := s.repo.GH(createArgs...); err != nil {
+			return nil, err
+		}
+		existing, err = s.findPR(targetBranch)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	s.stepf("updating PR #%d base to %s", existing.Number, base)
+	editArgs := []string{"pr", "edit", fmt.Sprintf("%d", existing.Number), "--base", base}
+	if title != "" {
+		editArgs = append(editArgs, "--title", title)
+	}
+	if body != "" {
+		editArgs = append(editArgs, "--body", body)
+	}
+	if _, err := s.repo.GH(editArgs...); err != nil {
+		return nil, err
+	}
+	if web {
+		s.stepf("opening PR #%d in browser", existing.Number)
+		if _, err := s.repo.GH("pr", "view", fmt.Sprintf("%d", existing.Number), "--web"); err != nil {
+			return nil, err
+		}
+	}
+	existing.BaseRefName = base
+	return &PRResult{
+		Number: existing.Number,
+		URL:    existing.URL,
+		Base:   existing.BaseRefName,
+		Head:   targetBranch,
+	}, nil
 }
 
 func (s *Service) ensureEffectiveBase(branch string) (string, error) {
@@ -335,12 +712,19 @@ func (s *Service) ensureEffectiveBase(branch string) (string, error) {
 	}
 	switch len(parents) {
 	case 0:
-		_ = s.repo.DeleteBranch(s.repo.SyntheticBranchName(branch))
-		return rootBranch, nil
+		if s.repo.BranchExists(s.repo.SyntheticBranchName(branch)) {
+			s.stepf("collapsing welded base")
+			_ = s.repo.DeleteBranch(s.repo.SyntheticBranchName(branch))
+		}
+		return s.rootBranch(), nil
 	case 1:
-		_ = s.repo.DeleteBranch(s.repo.SyntheticBranchName(branch))
+		if s.repo.BranchExists(s.repo.SyntheticBranchName(branch)) {
+			s.stepf("collapsing welded base")
+			_ = s.repo.DeleteBranch(s.repo.SyntheticBranchName(branch))
+		}
 		return parents[0], nil
 	default:
+		s.stepf("rebuilding welded base")
 		return s.repo.RebuildSyntheticBase(branch, parents)
 	}
 }
@@ -359,8 +743,8 @@ func (s *Service) requireManagedBranch(branch string) error {
 	if !s.repo.BranchExists(branch) {
 		return fmt.Errorf("branch %q does not exist", branch)
 	}
-	if branch == rootBranch {
-		return errors.New("master is the root branch and is not managed by weld")
+	if branch == s.rootBranch() {
+		return fmt.Errorf("%s is the root branch and is not managed by weld", s.rootBranch())
 	}
 	managed, err := s.meta.IsManaged(branch)
 	if err != nil {
@@ -373,9 +757,9 @@ func (s *Service) requireManagedBranch(branch string) error {
 }
 
 func (s *Service) requireManagedOrRoot(branch string) error {
-	if branch == rootBranch {
-		if !s.repo.BranchExists(rootBranch) {
-			return fmt.Errorf("branch %q does not exist", rootBranch)
+	if branch == s.rootBranch() {
+		if !s.repo.BranchExists(s.rootBranch()) {
+			return fmt.Errorf("branch %q does not exist", s.rootBranch())
 		}
 		return nil
 	}
@@ -422,7 +806,7 @@ func (s *Service) ancestorClosure(branch string) ([]string, error) {
 			return err
 		}
 		for _, parent := range parents {
-			if parent == rootBranch {
+			if parent == s.rootBranch() {
 				continue
 			}
 			if err := visit(parent); err != nil {
@@ -431,7 +815,7 @@ func (s *Service) ancestorClosure(branch string) ([]string, error) {
 		}
 		return nil
 	}
-	if branch != rootBranch {
+	if branch != s.rootBranch() {
 		if err := visit(branch); err != nil {
 			return nil, err
 		}
@@ -492,8 +876,85 @@ func (s *Service) syncOrder(branch string, tree bool) ([]string, error) {
 	return combined, nil
 }
 
+func (s *Service) refreshBranchesForSync(order []string, mode SyncMode) error {
+	if mode == SyncModeLocal || !s.remoteEnabled() || strings.TrimSpace(s.remoteName()) == "" || !s.repo.HasRemote(s.remoteName()) {
+		return nil
+	}
+	s.stepf("fetching %s", s.remoteName())
+	if err := s.repo.Fetch(s.remoteName()); err != nil {
+		return err
+	}
+	for _, branch := range order {
+		if branch == s.rootBranch() {
+			if mode == SyncModeRemote {
+				s.stepf("refreshing %s from %s/%s", s.rootBranch(), s.remoteName(), s.rootBranch())
+				if err := s.repo.UpdateLocalRoot(s.remoteName(), s.rootBranch()); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if err := s.repo.EnsureTrackingBranchIfRemoteExists(s.remoteName(), branch); err != nil {
+			return err
+		}
+		s.stepf("refreshing tracking branch for %s", branch)
+		if err := s.repo.UpdateLocalBranchFromTracking(branch); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func syncScopeLabel(tree bool) string {
+	if tree {
+		return "upstream + downstream"
+	}
+	return "upstream"
+}
+
+func (s *Service) snapshotRefsForSync(order []string) ([]refSnapshot, error) {
+	refs := map[string]struct{}{}
+	for _, branch := range order {
+		refs[s.repo.BranchRef(branch)] = struct{}{}
+		if branch == s.rootBranch() {
+			continue
+		}
+		refs[s.repo.BranchRef(s.repo.SyntheticBranchName(branch))] = struct{}{}
+	}
+
+	snapshots := make([]refSnapshot, 0, len(refs))
+	for ref := range refs {
+		if !s.repo.HasRef(ref) {
+			snapshots = append(snapshots, refSnapshot{Ref: ref, Exists: false})
+			continue
+		}
+		oid, err := s.repo.RefOID(ref)
+		if err != nil {
+			return nil, err
+		}
+		snapshots = append(snapshots, refSnapshot{Ref: ref, Exists: true, OID: oid})
+	}
+	sort.Slice(snapshots, func(i, j int) bool { return snapshots[i].Ref < snapshots[j].Ref })
+	return snapshots, nil
+}
+
+func (s *Service) restoreSnapshots(snapshots []refSnapshot) error {
+	for _, snapshot := range snapshots {
+		if snapshot.Exists {
+			if err := s.repo.UpdateRef(snapshot.Ref, snapshot.OID, ""); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := s.repo.DeleteRef(snapshot.Ref, ""); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Service) topologicalSort(start ...string) ([]string, error) {
-	needed := map[string]struct{}{rootBranch: {}}
+	needed := map[string]struct{}{s.rootBranch(): {}}
 	var collect func(string) error
 	collect = func(node string) error {
 		if node == "" {
@@ -503,7 +964,7 @@ func (s *Service) topologicalSort(start ...string) ([]string, error) {
 			return nil
 		}
 		needed[node] = struct{}{}
-		if node == rootBranch {
+		if node == s.rootBranch() {
 			return nil
 		}
 		parents, err := s.meta.Parents(node)
@@ -511,7 +972,7 @@ func (s *Service) topologicalSort(start ...string) ([]string, error) {
 			return err
 		}
 		if len(parents) == 0 {
-			return collect(rootBranch)
+			return collect(s.rootBranch())
 		}
 		for _, parent := range parents {
 			if err := collect(parent); err != nil {
@@ -532,7 +993,7 @@ func (s *Service) topologicalSort(start ...string) ([]string, error) {
 		if _, ok := inDegree[node]; !ok {
 			inDegree[node] = 0
 		}
-		if node == rootBranch {
+		if node == s.rootBranch() {
 			continue
 		}
 		parents, err := s.meta.Parents(node)
@@ -540,7 +1001,7 @@ func (s *Service) topologicalSort(start ...string) ([]string, error) {
 			return nil, err
 		}
 		if len(parents) == 0 {
-			parents = []string{rootBranch}
+			parents = []string{s.rootBranch()}
 		}
 		for _, parent := range parents {
 			if _, ok := needed[parent]; !ok {
@@ -583,7 +1044,7 @@ func (s *Service) hasPath(from string, to string) (bool, error) {
 	if from == to {
 		return true, nil
 	}
-	if from == rootBranch {
+	if from == s.rootBranch() {
 		return false, nil
 	}
 	parents, err := s.meta.Parents(from)
@@ -611,7 +1072,7 @@ func (s *Service) reconcileMetadata() error {
 		return err
 	}
 	for _, branch := range branches {
-		if branch == rootBranch {
+		if branch == s.rootBranch() {
 			_ = s.meta.Unmanage(branch)
 			continue
 		}
@@ -629,7 +1090,7 @@ func (s *Service) reconcileMetadata() error {
 		}
 		valid := make([]string, 0, len(parents))
 		for _, parent := range parents {
-			if parent == rootBranch {
+			if parent == s.rootBranch() {
 				continue
 			}
 			if s.repo.BranchExists(parent) {
@@ -676,7 +1137,7 @@ func (s *Service) currentEffectiveBase(branch string) (string, error) {
 	}
 	switch len(parents) {
 	case 0:
-		return rootBranch, nil
+		return s.rootBranch(), nil
 	case 1:
 		return parents[0], nil
 	default:
@@ -685,6 +1146,23 @@ func (s *Service) currentEffectiveBase(branch string) (string, error) {
 		}
 		return s.repo.RebuildSyntheticBase(branch, parents)
 	}
+}
+
+func (s *Service) prBase(branch string) (string, error) {
+	parents, err := s.meta.Parents(branch)
+	if err != nil {
+		return "", err
+	}
+	if len(parents) <= 1 {
+		if len(parents) == 0 {
+			return s.rootBranch(), nil
+		}
+		return parents[0], nil
+	}
+	if _, err := s.ensureEffectiveBase(branch); err != nil {
+		return "", err
+	}
+	return s.repo.SyntheticBranchName(branch), nil
 }
 
 func (s *Service) syncBranchToCurrentBase(branch string, oldBaseOID string) error {
@@ -707,7 +1185,104 @@ func (s *Service) syncBranchToCurrentBase(branch string, oldBaseOID string) erro
 	if oldBaseOID == "" || oldBaseOID == newBaseOID {
 		return nil
 	}
+	if base == s.repo.SyntheticBranchName(branch) {
+		s.stepf("rebasing %s onto welded base", branch)
+	} else {
+		s.stepf("rebasing %s onto %s", branch, base)
+	}
 	return s.repo.RebaseBranchOntoFrom(branch, oldBaseOID, base)
+}
+
+func (s *Service) shipPlan(branch string, tree bool) ([]string, []string, []string, error) {
+	order, err := s.syncOrder(branch, tree)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	realBranches := make([]string, 0)
+	syntheticBranches := make([]string, 0)
+	syntheticDeletes := make([]string, 0)
+	seenReal := map[string]struct{}{}
+	seenSynthetic := map[string]struct{}{}
+	seenSyntheticDeletes := map[string]struct{}{}
+	for _, item := range order {
+		if item == s.rootBranch() {
+			continue
+		}
+		parents, err := s.meta.Parents(item)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		for _, parent := range parents {
+			if parent == s.rootBranch() {
+				continue
+			}
+			if _, ok := seenReal[parent]; !ok {
+				seenReal[parent] = struct{}{}
+				realBranches = append(realBranches, parent)
+			}
+		}
+		if len(parents) > 1 {
+			synth := s.repo.SyntheticBranchName(item)
+			if _, ok := seenSynthetic[synth]; !ok {
+				seenSynthetic[synth] = struct{}{}
+				syntheticBranches = append(syntheticBranches, synth)
+			}
+		} else {
+			synth := s.repo.SyntheticBranchName(item)
+			if _, ok := seenSyntheticDeletes[synth]; !ok {
+				seenSyntheticDeletes[synth] = struct{}{}
+				syntheticDeletes = append(syntheticDeletes, synth)
+			}
+		}
+		if _, ok := seenReal[item]; !ok {
+			seenReal[item] = struct{}{}
+			realBranches = append(realBranches, item)
+		}
+	}
+	return realBranches, syntheticBranches, syntheticDeletes, nil
+}
+
+type ghPR struct {
+	Number      int    `json:"number"`
+	URL         string `json:"url"`
+	BaseRefName string `json:"baseRefName"`
+}
+
+func (s *Service) findPR(branch string) (*ghPR, error) {
+	out, err := s.repo.GH("pr", "list", "--head", branch, "--json", "number,url,baseRefName")
+	if err != nil {
+		return nil, err
+	}
+	var prs []ghPR
+	if err := json.Unmarshal([]byte(out), &prs); err != nil {
+		return nil, err
+	}
+	if len(prs) == 0 {
+		return &ghPR{}, nil
+	}
+	return &prs[0], nil
+}
+
+func (s *Service) refreshPRBaseIfExists(branch string) (bool, error) {
+	if !s.repo.HasGH() {
+		return false, nil
+	}
+	existing, err := s.findPR(branch)
+	if err != nil {
+		return false, nil
+	}
+	if existing.Number == 0 {
+		return false, nil
+	}
+	base, err := s.prBase(branch)
+	if err != nil {
+		return false, err
+	}
+	if _, err := s.repo.GH("pr", "edit", fmt.Sprintf("%d", existing.Number), "--base", base); err != nil {
+		return false, nil
+	}
+	return true, nil
 }
 
 func (s *Service) renderParentTree(branch string, prefix string, seen map[string]struct{}) ([]string, error) {
@@ -717,7 +1292,7 @@ func (s *Service) renderParentTree(branch string, prefix string, seen map[string
 	}
 	lines := make([]string, 0)
 	for i, parent := range parents {
-		if parent == rootBranch {
+		if parent == s.rootBranch() {
 			continue
 		}
 		if _, ok := seen[parent]; ok {

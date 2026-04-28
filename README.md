@@ -6,86 +6,126 @@ It is designed for workflows where a branch can depend on multiple sibling branc
 
 ## Current Scope
 
-This repository currently implements the local-only workflow:
+This repository implements:
 
 - local metadata stored in Git config under `weld.*`
+- configurable main branch and remote settings via `git weld init`
 - cycle validation and dependency graph traversal
-- local synthetic `_weld/*` branches for multi-parent effective bases
+- local welded bases, materialized internally as `_weld/*` branches when needed
 - branch-local diffing against the effective base
 - automatic pruning of stale weld metadata for deleted branches/parents
+- remote shipping for review correctness
+- GitHub PR creation and base refresh through `gh`
 
 Current commands:
 
 - `git weld new <branch>`
+- `git weld init [--main <branch>] [--remote <remote>] [--no-remote]`
 - `git weld stack <branch> [<base>] [-c|--create]`
 - `git weld unstack <branch> [<base>]`
 - `git weld show [<branch>] [--tree]`
 - `git weld status`
 - `git weld diff [<branch>]`
-- `git weld sync [<branch>] [--tree]`
-
-Not implemented yet:
-
-- `git weld ship`
-- `git weld pr`
-- GitHub integration
-- remote synthetic `_weld/*` refs
+- `git weld sync [<branch>] [--tree] [--local|--remote]`
+- `git weld ship [<branch>] [--tree] [--local|--remote]`
+- `git weld pr [<branch>] [--title <title>] [--body <body>] [--draft] [--web]`
 
 ## Command Behavior
 
 ### `git weld new <branch>`
 
-- creates `<branch>` from `master`
+- creates `<branch>` from the configured main branch
 - checks out the new branch
 - records the branch as weld-managed
-- uses implicit `master` as the root, so `master` is not stored as an explicit parent
+- uses the configured main branch as the implicit root, so it is not stored as an explicit parent
+- preserves staged, unstaged, and untracked changes across the branch switch
+
+### `git weld init [--main <branch>] [--remote <remote>] [--no-remote]`
+
+- with no flags, prompts for:
+  - the main branch
+  - the remote name, or `none` to disable remote features
+- with flags, configures settings non-interactively
+  - `--main <branch>` sets the implicit root branch
+  - `--remote <remote>` sets the remote used for sync/ship/pr
+  - `--no-remote` disables remote-aware features
+- stores those settings in local Git config under `weld.*`
+- if remote features are disabled, `git weld ship` and `git weld pr` will error until a remote is configured again
 
 ### `git weld stack <branch> [<base>]`
 
 - adds `[<base>]` as a parent of an existing managed branch
 - if `[<base>]` is omitted, it defaults to the current branch
-- if the target branch currently has no explicit parents, stacking replaces the implicit `master` root with the new explicit parent
+- if the target branch currently has no explicit parents, stacking replaces the implicit root with the new explicit parent
 
 ### `git weld stack -c <branch> [<base>]`
 
 - creates `<branch>` from `[<base>]`
 - checks out the new branch
 - if `[<base>]` is omitted, it defaults to the current branch
+- preserves staged, unstaged, and untracked changes across the branch switch
 
 ### `git weld unstack <branch> [<base>]`
 
 - removes `[<base>]` from the branch's explicit parents
-- if the last explicit parent is removed, the branch falls back to implicit `master`
+- if the last explicit parent is removed, the branch falls back to the implicit root branch
 
 ### `git weld show [<branch>]`
 
 - shows the branch and its parent tree
-- omits `master` because it is treated as the implicit root
+- omits the configured main branch because it is treated as the implicit root
 
 ### `git weld show --tree [<branch>]`
 
 - shows both:
-  - `(parents)` tree
-  - `(children)` tree
+  - `(upstream)` tree
+  - `(downstream)` tree
 - descendants are rooted at the target branch only, so sibling branches under `master` are not included
 
 ### `git weld status`
 
 - lists all weld-managed branches
 - shows only explicit parents
-- branches rooted directly on `master` display as an empty block
+- branches rooted directly on the configured main branch display as an empty block
 
 ### `git weld diff [<branch>]`
 
 - shows only the changes introduced by the branch relative to its current effective base
 
-### `git weld sync [<branch>] [--tree]`
+### `git weld sync [<branch>] [--tree] [--local|--remote]`
 
+- refreshes tracked branches in scope, excluding the configured main branch
+- if a tracked branch has remote-only commits, rebases the local branch onto its tracking branch first
 - updates the local branch graph
-- rebuilds synthetic `_weld/*` branches as needed
+- rebuilds welded bases as needed
 - rebases managed branches onto their current effective base
 - auto-prunes stale metadata for deleted branches and deleted parents
 - `--tree` also syncs descendants
+- `--local` skips all remote refresh and syncs against local refs only
+- `--remote` also refreshes the configured main branch
+- requires a clean working tree before it runs
+- if a tracking rebase or weld rebase conflicts, the command exits, aborts the failed rebase, and restores the repo to its starting state
+
+### `git weld ship [<branch>] [--tree] [--local|--remote]`
+
+- requires a configured remote
+- runs `sync` first
+- pushes the minimum required real branches for the requested branch or tree
+- pushes welded bases when a multi-parent review base is required
+- refreshes existing GitHub PR bases when `gh` is available
+- deletes stale remote welded bases after PR bases have been retargeted
+- `--local` ships after a local-only sync
+- `--remote` ships after a sync that also refreshes the configured main branch
+
+### `git weld pr [<branch>] [--title <title>] [--body <body>] [--draft] [--web]`
+
+- requires a configured remote and `gh`
+- runs `ship` first
+- uses the real parent as the PR base for single-parent branches
+- uses a welded base for multi-parent branches
+- supports explicit title/body overrides
+- `--draft` creates a draft PR when a new PR is opened
+- `--web` opens the PR in the browser after create/edit
 
 ## Build
 
@@ -135,10 +175,11 @@ Build:
 go build ./...
 ```
 
-## Next Steps
+## Notes
 
-Planned Phase 2 work:
-
-- `ship` support for remote review correctness
-- `pr` support with GitHub integration via `gh`
-- remote synthetic `_weld/*` refs and PR refresh behavior
+- Remote features currently assume the configured remote points at a GitHub repository when `gh` is used.
+- Existing repositories default to:
+  - main branch: `master`
+  - remote: `origin`
+- Run `git weld init` to override those defaults.
+- If a tracking rebase or weld rebase conflicts, Weld exits safely and restores the repo to its starting state.

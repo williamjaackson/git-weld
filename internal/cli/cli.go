@@ -13,6 +13,7 @@ import (
 type CLI struct {
 	stdout io.Writer
 	stderr io.Writer
+	stdin  io.Reader
 	cwd    string
 }
 
@@ -25,6 +26,7 @@ func Run(args []string) error {
 	cli := &CLI{
 		stdout: os.Stdout,
 		stderr: os.Stderr,
+		stdin:  os.Stdin,
 		cwd:    cwd,
 	}
 	return cli.run(args)
@@ -45,6 +47,8 @@ func (c *CLI) run(args []string) error {
 		return err
 	case "new":
 		return c.runNew(args[1:])
+	case "init":
+		return c.runInit(args[1:])
 	case "stack":
 		return c.runStack(args[1:])
 	case "unstack":
@@ -57,6 +61,10 @@ func (c *CLI) run(args []string) error {
 		return c.runDiff(args[1:])
 	case "sync":
 		return c.runSync(args[1:])
+	case "ship":
+		return c.runShip(args[1:])
+	case "pr":
+		return c.runPR(args[1:])
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
@@ -70,7 +78,36 @@ func (c *CLI) runNew(args []string) error {
 	if err != nil {
 		return err
 	}
+	c.bindReporter(svc)
 	return svc.NewBranch(args[0])
+}
+
+func (c *CLI) runInit(args []string) error {
+	svc, err := weld.Open(c.cwd)
+	if err != nil {
+		return err
+	}
+	mainBranch, remoteName, remoteDisabled, interactive, err := parseInitArgs(args)
+	if err != nil {
+		return err
+	}
+	if interactive {
+		if err := svc.InitInteractive(c.stdin, c.stdout); err != nil {
+			return err
+		}
+		return nil
+	}
+	if mainBranch == "" {
+		mainBranch = svc.Settings().RootBranch
+	}
+	if !remoteDisabled && remoteName == "" {
+		remoteName = svc.Settings().RemoteName
+		if remoteName == "" {
+			remoteName = weld.DefaultSettings().RemoteName
+		}
+	}
+	c.bindReporter(svc)
+	return svc.Init(mainBranch, remoteName, remoteDisabled)
 }
 
 func (c *CLI) runStack(args []string) error {
@@ -95,6 +132,13 @@ func (c *CLI) runStack(args []string) error {
 		if len(positional) == 2 {
 			base = positional[1]
 		}
+		if base == "" {
+			base, err = svc.CurrentBranch()
+			if err != nil {
+				return err
+			}
+		}
+		c.bindReporter(svc)
 		return svc.Stack(positional[0], base, true)
 	}
 
@@ -105,6 +149,13 @@ func (c *CLI) runStack(args []string) error {
 	if len(positional) == 2 {
 		base = positional[1]
 	}
+	if base == "" {
+		base, err = svc.CurrentBranch()
+		if err != nil {
+			return err
+		}
+	}
+	c.bindReporter(svc)
 	return svc.Stack(positional[0], base, false)
 }
 
@@ -120,6 +171,7 @@ func (c *CLI) runUnstack(args []string) error {
 	if len(args) == 2 {
 		base = args[1]
 	}
+	c.bindReporter(svc)
 	return svc.Unstack(args[0], base)
 }
 
@@ -198,13 +250,18 @@ func (c *CLI) runDiff(args []string) error {
 
 func (c *CLI) runSync(args []string) error {
 	positional, flags, err := parseBoolFlags(args, map[string]string{
-		"--tree": "tree",
+		"--tree":   "tree",
+		"--local":  "local",
+		"--remote": "remote",
 	})
 	if err != nil {
 		return err
 	}
+	if flags["local"] && flags["remote"] {
+		return errors.New("usage: git weld sync [<branch>] [--tree] [--local|--remote]")
+	}
 	if len(positional) > 1 {
-		return errors.New("usage: git weld sync [<branch>] [--tree]")
+		return errors.New("usage: git weld sync [<branch>] [--tree] [--local|--remote]")
 	}
 
 	svc, err := weld.Open(c.cwd)
@@ -215,7 +272,110 @@ func (c *CLI) runSync(args []string) error {
 	if len(positional) == 1 {
 		branch = positional[0]
 	}
-	return svc.Sync(branch, flags["tree"])
+	c.bindReporter(svc)
+	return svc.Sync(branch, flags["tree"], syncModeFromFlags(flags))
+}
+
+func (c *CLI) runShip(args []string) error {
+	positional, flags, err := parseBoolFlags(args, map[string]string{
+		"--tree":   "tree",
+		"--local":  "local",
+		"--remote": "remote",
+	})
+	if err != nil {
+		return err
+	}
+	if flags["local"] && flags["remote"] {
+		return errors.New("usage: git weld ship [<branch>] [--tree] [--local|--remote]")
+	}
+	if len(positional) > 1 {
+		return errors.New("usage: git weld ship [<branch>] [--tree] [--local|--remote]")
+	}
+
+	svc, err := weld.Open(c.cwd)
+	if err != nil {
+		return err
+	}
+	branch := ""
+	if len(positional) == 1 {
+		branch = positional[0]
+	}
+	c.bindReporter(svc)
+	_, err = svc.Ship(branch, flags["tree"], syncModeFromFlags(flags))
+	return err
+}
+
+func syncModeFromFlags(flags map[string]bool) weld.SyncMode {
+	if flags["local"] {
+		return weld.SyncModeLocal
+	}
+	if flags["remote"] {
+		return weld.SyncModeRemote
+	}
+	return weld.SyncModeDefault
+}
+
+func parseInitArgs(args []string) (string, string, bool, bool, error) {
+	mainBranch := ""
+	remoteName := ""
+	remoteDisabled := false
+	interactive := len(args) == 0
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch arg {
+		case "--main":
+			i++
+			if i >= len(args) {
+				return "", "", false, false, errors.New("usage: git weld init [--main <branch>] [--remote <remote>] [--no-remote]")
+			}
+			mainBranch = args[i]
+			interactive = false
+		case "--remote":
+			i++
+			if i >= len(args) {
+				return "", "", false, false, errors.New("usage: git weld init [--main <branch>] [--remote <remote>] [--no-remote]")
+			}
+			remoteName = args[i]
+			interactive = false
+		case "--no-remote":
+			remoteDisabled = true
+			interactive = false
+		default:
+			if strings.HasPrefix(arg, "--main=") {
+				mainBranch = strings.TrimPrefix(arg, "--main=")
+				interactive = false
+				continue
+			}
+			if strings.HasPrefix(arg, "--remote=") {
+				remoteName = strings.TrimPrefix(arg, "--remote=")
+				interactive = false
+				continue
+			}
+			return "", "", false, false, fmt.Errorf("unknown flag %q", arg)
+		}
+	}
+	if remoteDisabled && remoteName != "" {
+		return "", "", false, false, errors.New("usage: git weld init [--main <branch>] [--remote <remote>] [--no-remote]")
+	}
+	return mainBranch, remoteName, remoteDisabled, interactive, nil
+}
+
+func (c *CLI) runPR(args []string) error {
+	branch, title, body, draft, web, err := parsePRArgs(args)
+	if err != nil {
+		return err
+	}
+	svc, err := weld.Open(c.cwd)
+	if err != nil {
+		return err
+	}
+	c.bindReporter(svc)
+	result, err := svc.PR(branch, title, body, draft, web)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(c.stdout, "pr ready: #%d %s\n", result.Number, result.URL)
+	return err
 }
 
 func parseBoolFlags(args []string, known map[string]string) ([]string, map[string]bool, error) {
@@ -238,6 +398,52 @@ func parseBoolFlags(args []string, known map[string]string) ([]string, map[strin
 	return positional, flags, nil
 }
 
+func parsePRArgs(args []string) (string, string, string, bool, bool, error) {
+	branch := ""
+	title := ""
+	body := ""
+	draft := false
+	web := false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch arg {
+		case "--title":
+			i++
+			if i >= len(args) {
+				return "", "", "", false, false, errors.New("usage: git weld pr [<branch>] [--title <title>] [--body <body>] [--draft] [--web]")
+			}
+			title = args[i]
+		case "--body":
+			i++
+			if i >= len(args) {
+				return "", "", "", false, false, errors.New("usage: git weld pr [<branch>] [--title <title>] [--body <body>] [--draft] [--web]")
+			}
+			body = args[i]
+		case "--draft":
+			draft = true
+		case "--web":
+			web = true
+		default:
+			if strings.HasPrefix(arg, "--title=") {
+				title = strings.TrimPrefix(arg, "--title=")
+				continue
+			}
+			if strings.HasPrefix(arg, "--body=") {
+				body = strings.TrimPrefix(arg, "--body=")
+				continue
+			}
+			if strings.HasPrefix(arg, "-") {
+				return "", "", "", false, false, fmt.Errorf("unknown flag %q", arg)
+			}
+			if branch != "" {
+				return "", "", "", false, false, errors.New("usage: git weld pr [<branch>] [--title <title>] [--body <body>] [--draft] [--web]")
+			}
+			branch = arg
+		}
+	}
+	return branch, title, body, draft, web, nil
+}
+
 func printHelp(out io.Writer) {
 	fmt.Fprintln(out, "git-weld")
 	fmt.Fprintln(out, "")
@@ -246,14 +452,19 @@ func printHelp(out io.Writer) {
 	fmt.Fprintln(out, "")
 	fmt.Fprintln(out, "Commands:")
 	fmt.Fprintln(out, "  new <branch>")
+	fmt.Fprintln(out, "  init [--main <branch>] [--remote <remote>] [--no-remote]")
 	fmt.Fprintln(out, "  stack <branch> [<base>] [-c|--create]")
 	fmt.Fprintln(out, "  unstack <branch> [<base>]")
 	fmt.Fprintln(out, "  show [<branch>] [--tree]")
 	fmt.Fprintln(out, "  status")
 	fmt.Fprintln(out, "  diff [<branch>]")
-	fmt.Fprintln(out, "  sync [<branch>] [--tree]")
-	fmt.Fprintln(out, "")
-	fmt.Fprintln(out, "Commands planned for Phase 2:")
-	fmt.Fprintln(out, "  ship [<branch>] [--tree]")
-	fmt.Fprintln(out, "  pr [<branch>]")
+	fmt.Fprintln(out, "  sync [<branch>] [--tree] [--local|--remote]")
+	fmt.Fprintln(out, "  ship [<branch>] [--tree] [--local|--remote]")
+	fmt.Fprintln(out, "  pr [<branch>] [--title <title>] [--body <body>] [--draft] [--web]")
+}
+
+func (c *CLI) bindReporter(svc *weld.Service) {
+	svc.SetReporter(func(message string) {
+		_, _ = fmt.Fprintf(c.stdout, "==> %s\n", message)
+	})
 }
