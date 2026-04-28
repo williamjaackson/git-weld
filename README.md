@@ -4,6 +4,33 @@
 
 It is designed for workflows where a branch can depend on multiple sibling branches at once, while still allowing you to view and rebase only the branch-specific work.
 
+## Getting Started
+
+Clone the repo:
+
+```bash
+git clone https://github.com/williamjaackson/git-weld
+cd git-weld
+```
+
+Install the binary into a directory on your `PATH`:
+
+```bash
+make install INSTALL_DIR="$HOME/.local/bin"
+```
+
+Initialize `git-weld` in your repository:
+
+```bash
+git weld init
+```
+
+Show the available commands:
+
+```bash
+git weld help
+```
+
 ## Current Scope
 
 This repository implements:
@@ -178,21 +205,6 @@ Current commands:
 ```bash
 make build
 ./bin/git-weld help
-```
-
-## Install
-
-Clone the repo:
-
-```bash
-git clone https://github.com/williamjaackson/git-weld
-cd git-weld
-```
-
-Install the binary into a directory on your `PATH`:
-
-```bash
-make install INSTALL_DIR="$HOME/.local/bin"
 ```
 
 ## Development
