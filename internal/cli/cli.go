@@ -620,6 +620,8 @@ func printHelp(out io.Writer) {
 	fmt.Fprintln(out, "  git weld <command> [options]")
 	fmt.Fprintln(out, "")
 	fmt.Fprintln(out, "Commands:")
+	fmt.Fprintln(out, "  help")
+	fmt.Fprintln(out, "  version")
 	fmt.Fprintln(out, "  new <branch>")
 	fmt.Fprintln(out, "  init [--main <branch>] [--remote <remote>] [--no-remote]")
 	fmt.Fprintln(out, "  stack <branch> [<base>] [-c|--create]")
